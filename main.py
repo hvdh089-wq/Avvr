@@ -59,7 +59,7 @@ def save_json_file(file_path, data):
         with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception as e:
-        print(f"خطأ أثناء حفظ الملف {file_path}: {str(e)}")
+        print(f"خطأ في الحفظ: {str(e)}")
 
 def log_activity(user_id, action_type, details=""):
     logs = load_json_file(LOGS_FILE, [])
@@ -84,16 +84,16 @@ def is_ip_banned(ip_address):
             save_json_file(BANS_FILE, bans)
     return False
 
-def ban_ip(ip_address, reason="سلوك مشبوه أو هجوم أمني"):
+def ban_ip(ip_address, reason="سلوك مشبوه"):
     bans = load_json_file(BANS_FILE, {})
     bans[ip_address] = time.time() + BAN_DURATION
     save_json_file(BANS_FILE, bans)
     log_activity("SYSTEM", "IP_BAN", f"IP: {ip_address}, Reason: {reason}")
-    notify_admin_telegram(f"🚨 <b>تنبيه أمني:</b> تم حظر IP تلقائياً لمده 48 ساعة.\n<b>العنوان:</b> <code>{ip_address}</code>\n<b>السبب:</b> {reason}")
+    notify_admin_telegram(f"🚨 <b>حظر تلقائي:</b>\nIP: <code>{ip_address}</code>\nالسبب: {reason}")
 
 def security_firewall(ip_address, payload_string=""):
     if is_ip_banned(ip_address):
-        return False, "تم حظر وصولك مؤقتاً لدواعي الأمان."
+        return False, "تم حظر وصولك مؤقتاً."
 
     suspicious_patterns = [
         r"(?i)<script", r"(?i)union\s+select", r"(?i)drop\s+table",
@@ -102,7 +102,7 @@ def security_firewall(ip_address, payload_string=""):
     for pattern in suspicious_patterns:
         if re.search(pattern, payload_string):
             ban_ip(ip_address, "محاولة حقن كود خبيث")
-            return False, "تم رفض الطلب وحظر العنوان."
+            return False, "تم رفض الطلب."
 
     now = time.time()
     if ip_address not in ip_request_tracker:
@@ -112,13 +112,13 @@ def security_firewall(ip_address, payload_string=""):
     ip_request_tracker[ip_address].append(now)
 
     if len(ip_request_tracker[ip_address]) > MAX_REQUESTS_PER_MINUTE:
-        ban_ip(ip_address, "تجاوز معدل الطلبات المسموح (إغراق)")
-        return False, "تجاوزت الحد المسموح من الطلبات."
+        ban_ip(ip_address, "تجاوز معدل الطلبات")
+        return False, "تجاوزت الحد المسموح."
 
     return True, "OK"
 
 # ==============================================================================
-# 3. إدارة الجلسات وسجلات المستخدمين والخصوصية
+# 3. إدارة الجلسات والخصوصية
 # ==============================================================================
 def get_user_data(user_id):
     db = load_json_file(CHAT_DB_FILE, {})
@@ -172,17 +172,16 @@ def append_chat_message(user_id, session_id, role, content, image_data=None):
                 break
 
 # ==============================================================================
-# 4. محرك الذكاء الاصطناعي التكاملي (Text + Vision + Generation)
+# 4. محرك الذكاء الاصطناعي التكاملي
 # ==============================================================================
-def ask_unified_ai_engine(prompt, conversation_history=None, image_b64=None):
+def ask_unified_ai_engine(prompt, conversation_history=None):
     if conversation_history is None:
         conversation_history = []
 
     system_instruction = (
         "أنت 'نظام الجبوري الذكي'، مساعد رقمي متطور. "
         "أجب دائماً باللغة العربية الفصحى المنسقة بدقة. "
-        "عند طلب كود برمجي، قدمه كاملاً داخل مربع كود مخصص ومحدد اللغة مع شرح بسيط. "
-        "تذكر سياق المحادثات السابقة واستوعب التفاصيل بدقة."
+        "عند طلب كود برمجي، قدمه كاملاً داخل مربع كود مخصص ومحدد اللغة مع شرح بسيط."
     )
 
     formatted_messages = [{"role": "system", "content": system_instruction}]
@@ -190,7 +189,6 @@ def ask_unified_ai_engine(prompt, conversation_history=None, image_b64=None):
         formatted_messages.append({"role": msg["role"], "content": msg["content"]})
     formatted_messages.append({"role": "user", "content": prompt})
 
-    # Groq API
     try:
         res = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -203,7 +201,6 @@ def ask_unified_ai_engine(prompt, conversation_history=None, image_b64=None):
     except Exception:
         pass
 
-    # OpenRouter API
     try:
         res = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -216,25 +213,7 @@ def ask_unified_ai_engine(prompt, conversation_history=None, image_b64=None):
     except Exception:
         pass
 
-    # Gemini API Backup
-    try:
-        gemini_prompt = system_instruction + "\n\n"
-        for msg in conversation_history[-6:]:
-            gemini_prompt += f"{msg['role']}: {msg['content']}\n"
-        gemini_prompt += f"user: {prompt}"
-
-        res = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_KEY}",
-            headers={"Content-Type": "application/json"},
-            json={"contents": [{"parts": [{"text": gemini_prompt}]}]},
-            timeout=12
-        )
-        if res.status_code == 200:
-            return res.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-    except Exception:
-        pass
-
-    return "اعتذر، تعذر معالجة الطلب حالياً بسبب ضغط الخوادم. يرجى المحاولة لاحقاً."
+    return "اعتذر، تعذر معالجة الطلب حالياً بسبب ضغط الخوادم."
 
 def generate_image_ai(prompt_text):
     try:
@@ -247,7 +226,7 @@ def generate_image_ai(prompt_text):
             with open(filepath, 'wb') as f:
                 f.write(res.content)
             return True, f"/download_file/{filename}"
-    except Exception as e:
+    except Exception:
         pass
     return False, "تعذر إنشاء الصورة حالياً."
 
@@ -262,7 +241,7 @@ def notify_admin_telegram(message_text):
     threading.Thread(target=send).start()
 
 # ==============================================================================
-# 5. خادم Flask والإعدادات الحركية
+# 5. خادم Flask والإعدادات
 # ==============================================================================
 app = Flask(__name__)
 CORS(app)
@@ -279,13 +258,13 @@ def apply_firewall_check():
         return jsonify({'success': False, 'message': message}), 403
 
 # ==============================================================================
-# 6. واجهة المستخدم التفاعلية المتجاوبة (UI Fully Responsive for Mobile & PC)
+# 6. واجهة المستخدم المتجاوبة بالكامل (HTML / CSS / JS)
 # ==============================================================================
 WEB_UI_TEMPLATE = """<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>نظام الجبوري الذكي</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&display=swap" rel="stylesheet">
@@ -294,17 +273,15 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
             --bg-primary: #0f172a;
             --bg-secondary: #1e293b;
             --accent-color: #2563eb;
-            --accent-hover: #1d4ed8;
             --text-main: #f8fafc;
             --text-muted: #94a3b8;
             --border-color: #334155;
             --code-bg: #090d16;
             --danger: #ef4444;
             --success: #10b981;
-            --safe-bottom: env(safe-area-inset-bottom, 0px);
         }
 
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Tajawal', sans-serif; -webkit-tap-highlight-color: transparent; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Tajawal', sans-serif; }
         html, body { height: 100%; width: 100%; background-color: var(--bg-primary); color: var(--text-main); overflow: hidden; }
 
         .app-container { display: flex; height: 100vh; height: 100dvh; width: 100vw; position: relative; overflow: hidden; }
@@ -318,16 +295,15 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
         .btn-new-chat {
             background: var(--accent-color); color: white; border: none; padding: 12px; border-radius: 12px;
             font-weight: bold; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;
-            margin-bottom: 15px; transition: 0.2s;
+            margin-bottom: 15px;
         }
-        .btn-new-chat:hover { background: var(--accent-hover); }
         .history-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
         .history-item {
             padding: 10px 12px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color);
             border-radius: 8px; cursor: pointer; font-size: 0.88rem; color: var(--text-muted);
-            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: 0.2s;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
-        .history-item:hover, .history-item.active { background: rgba(37, 99, 235, 0.2); color: #fff; border-color: var(--accent-color); }
+        .history-item.active { background: rgba(37, 99, 235, 0.2); color: #fff; border-color: var(--accent-color); }
 
         .main-wrapper { flex: 1; display: flex; flex-direction: column; height: 100%; width: 100%; overflow: hidden; position: relative; }
         
@@ -337,15 +313,14 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
         }
         .mobile-toggle { display: none; background: none; border: none; color: #fff; font-size: 1.3rem; cursor: pointer; }
         
-        .header-nav { display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none; }
-        .header-nav::-webkit-scrollbar { display: none; }
+        .header-nav { display: flex; gap: 8px; overflow-x: auto; }
         .nav-tab {
             background: transparent; border: none; color: var(--text-muted); padding: 8px 14px;
-            font-weight: bold; cursor: pointer; border-radius: 8px; font-size: 0.9rem; transition: 0.2s; white-space: nowrap;
+            font-weight: bold; cursor: pointer; border-radius: 8px; font-size: 0.9rem; white-space: nowrap;
         }
-        .nav-tab.active, .nav-tab:hover { background: var(--accent-color); color: white; }
+        .nav-tab.active { background: var(--accent-color); color: white; }
 
-        .content-panel { flex: 1; display: none; padding: 15px; overflow-y: auto; padding-bottom: calc(15px + var(--safe-bottom)); }
+        .content-panel { flex: 1; display: none; padding: 15px; overflow-y: auto; }
         .content-panel.active { display: flex; flex-direction: column; }
 
         .chat-container { flex: 1; display: flex; flex-direction: column; max-width: 900px; margin: 0 auto; width: 100%; height: 100%; }
@@ -355,7 +330,7 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
         .message-row.user { align-self: flex-start; }
         .message-row.ai { align-self: flex-end; width: 100%; }
 
-        .msg-bubble { padding: 12px 16px; border-radius: 14px; font-size: 0.95rem; line-height: 1.6; position: relative; word-break: break-word; }
+        .msg-bubble { padding: 12px 16px; border-radius: 14px; font-size: 0.95rem; line-height: 1.6; word-break: break-word; }
         .user .msg-bubble { background: var(--accent-color); color: white; border-bottom-right-radius: 2px; }
         .ai .msg-bubble { background: var(--bg-secondary); border: 1px solid var(--border-color); color: var(--text-main); border-bottom-left-radius: 2px; }
 
@@ -363,9 +338,8 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
         code { font-family: monospace; color: #38bdf8; }
         .btn-copy-code { position: absolute; top: 5px; left: 5px; background: var(--border-color); color: #fff; border: none; padding: 3px 6px; border-radius: 4px; font-size: 0.7rem; cursor: pointer; }
 
-        .input-area { display: flex; gap: 8px; padding: 10px 0; padding-bottom: calc(10px + var(--safe-bottom)); background: var(--bg-primary); }
+        .input-area { display: flex; gap: 8px; padding: 10px 0; background: var(--bg-primary); }
         .chat-input { flex: 1; background: var(--bg-secondary); border: 1px solid var(--border-color); padding: 12px; border-radius: 12px; color: white; outline: none; font-size: 0.95rem; }
-        .chat-input:focus { border-color: var(--accent-color); }
         .btn-send { background: var(--accent-color); color: white; border: none; padding: 0 18px; border-radius: 12px; cursor: pointer; font-weight: bold; }
 
         .card-panel { background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; max-width: 600px; margin: 0 auto; width: 100%; }
@@ -408,7 +382,7 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
             <div class="chat-container">
                 <div class="chat-messages" id="chatMessages"></div>
                 <div class="input-area">
-                    <input type="text" id="userInput" class="chat-input" placeholder="اسأل أي شيء أو اطلب كوداً..." onkeypress="if(event.key==='Enter') sendMessage()">
+                    <input type="text" id="userInput" class="chat-input" placeholder="اسأل أي شيء..." onkeypress="if(event.key==='Enter') sendMessage()">
                     <button class="btn-send" onclick="sendMessage()"><i class="fa-solid fa-paper-plane"></i></button>
                 </div>
             </div>
@@ -416,12 +390,12 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
 
         <div id="tab-image" class="content-panel">
             <div class="card-panel">
-                <h3 style="margin-bottom:15px;"><i class="fa-solid fa-wand-magic-sparkles"></i> توليد الصور بالذكاء الاصطناعي</h3>
+                <h3 style="margin-bottom:15px;"><i class="fa-solid fa-wand-magic-sparkles"></i> توليد الصور</h3>
                 <div class="form-group">
-                    <label>وصف الصورة (Prompt):</label>
-                    <textarea id="imgPrompt" class="form-control" rows="3" placeholder="اكتب وصفاً تفصيلياً للصورة باللغة الإنجليزية أو العربية..."></textarea>
+                    <label>وصف الصورة:</label>
+                    <textarea id="imgPrompt" class="form-control" rows="3" placeholder="وصف الصورة..."></textarea>
                 </div>
-                <button class="btn-new-chat" style="width:100%" onclick="generateImage()"><i class="fa-solid fa-paint-brush"></i> إنشاء الصورة</button>
+                <button class="btn-new-chat" style="width:100%" onclick="generateImage()"><i class="fa-solid fa-paint-brush"></i> إنشاء</button>
                 <div id="imgResult" style="margin-top:15px; text-align:center;"></div>
             </div>
         </div>
@@ -430,29 +404,28 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
             <div class="card-panel">
                 <h3 style="margin-bottom:15px;"><i class="fa-solid fa-headphones"></i> تحويل النص إلى صوت</h3>
                 <div class="form-group">
-                    <label>اختر نبرة الصوت:</label>
+                    <label>اختر الصوت:</label>
                     <select id="ttsVoice" class="form-control">
-                        <option value="pNInz6obpgDQGcFmaJgB">👨 آدم (فصيح)</option>
-                        <option value="ErXwobaYiN019PkySvjV">👨 أنطوني</option>
-                        <option value="21m00Tcm4TlvDq8ikWAM">👩 راشيل</option>
+                        <option value="pNInz6obpgDQGcFmaJgB">آدم</option>
+                        <option value="ErXwobaYiN019PkySvjV">أنطوني</option>
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>النص المراد تحويله:</label>
-                    <textarea id="ttsText" class="form-control" rows="3" placeholder="اكتب النص هنا..."></textarea>
+                    <label>النص:</label>
+                    <textarea id="ttsText" class="form-control" rows="3" placeholder="اكتب النص..."></textarea>
                 </div>
-                <button class="btn-new-chat" style="width:100%" onclick="generateAudio()"><i class="fa-solid fa-play"></i> توليد الصوت</button>
+                <button class="btn-new-chat" style="width:100%" onclick="generateAudio()"><i class="fa-solid fa-play"></i> تحويل</button>
                 <div id="ttsAudioPlayer" style="margin-top:15px;"></div>
             </div>
         </div>
 
         <div id="tab-download" class="content-panel">
             <div class="card-panel">
-                <h3 style="margin-bottom:15px;"><i class="fa-solid fa-cloud-arrow-down"></i> مركز التحميل المباشر</h3>
+                <h3 style="margin-bottom:15px;"><i class="fa-solid fa-cloud-arrow-down"></i> التحميل المباشر</h3>
                 <div class="form-group">
-                    <input type="url" id="dlUrl" class="form-control" placeholder="لصق رابط تيك توك، يوتيوب، أو أي فيديو...">
+                    <input type="url" id="dlUrl" class="form-control" placeholder="رابط الفيديو...">
                 </div>
-                <button class="btn-new-chat" style="width:100%" onclick="executeDownload()"><i class="fa-solid fa-download"></i> بدء التحميل</button>
+                <button class="btn-new-chat" style="width:100%" onclick="executeDownload()"><i class="fa-solid fa-download"></i> تحميل</button>
                 <div id="dlStatus" style="margin-top:12px; text-align:center;"></div>
                 <div id="mediaGallery" style="margin-top:18px;"></div>
             </div>
@@ -465,9 +438,7 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
     localStorage.setItem('jbouri_uid', currentUserId);
     let activeSessionId = null;
 
-    function toggleSidebar() {
-        document.getElementById('sidebar').classList.toggle('open');
-    }
+    function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); }
 
     function switchTab(tab) {
         document.querySelectorAll('.nav-tab').forEach(b => b.classList.remove('active'));
@@ -480,7 +451,7 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
 
     async function loadSessions() {
         try {
-            const res = await fetch(`/api/sessions?user_id=${currentUserId}`);
+            const res = await fetch('/api/sessions?user_id=' + currentUserId);
             const data = await res.json();
             const list = document.getElementById('historyList');
             list.innerHTML = '';
@@ -492,7 +463,7 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
 
             data.sessions.forEach(s => {
                 const div = document.createElement('div');
-                div.className = `history-item ${s.session_id === activeSessionId ? 'active' : ''}`;
+                div.className = 'history-item ' + (s.session_id === activeSessionId ? 'active' : '');
                 div.innerText = s.title;
                 div.onclick = () => selectSession(s.session_id, s.messages);
                 list.appendChild(div);
@@ -527,17 +498,17 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
     function renderMessage(role, content) {
         const box = document.getElementById('chatMessages');
         const row = document.createElement('div');
-        row.className = `message-row ${role}`;
+        row.className = 'message-row ' + role;
 
         let formattedContent = formatCodeBlocks(content);
-        row.innerHTML = `<div class="msg-bubble">${formattedContent}</div>`;
+        row.innerHTML = '<div class="msg-bubble">' + formattedContent + '</div>';
         box.appendChild(row);
         box.scrollTop = box.scrollHeight;
     }
 
     function formatCodeBlocks(text) {
         return text.replace(/```(\\w*)\\n([\\s\\S]*?)```/g, function(match, lang, code) {
-            return `<pre><code>${escapeHtml(code.trim())}</code><button class="btn-copy-code" onclick="copyCode(this)">نسخ الكود</button></pre>`;
+            return '<pre><code>' + escapeHtml(code.trim()) + '</code><button class="btn-copy-code" onclick="copyCode(this)">نسخ</button></pre>';
         }).replace(/\\n/g, '<br>');
     }
 
@@ -567,7 +538,7 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
         const code = btn.previousElementSibling.innerText;
         navigator.clipboard.writeText(code);
         btn.innerText = 'تم!';
-        setTimeout(() => btn.innerText = 'نسخ الكود', 2000);
+        setTimeout(() => btn.innerText = 'نسخ', 2000);
     }
 
     async function generateImage() {
@@ -575,7 +546,7 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
         const resultDiv = document.getElementById('imgResult');
         if(!prompt) return;
 
-        resultDiv.innerHTML = '⏳ جاري تصميم الصورة بالذكاء الاصطناعي...';
+        resultDiv.innerHTML = '⏳ جاري التصميم...';
         const res = await fetch('/api/generate_image', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
@@ -583,9 +554,9 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
         });
         const data = await res.json();
         if(data.success) {
-            resultDiv.innerHTML = `<img src="${data.image_url}" style="max-width:100%; border-radius:12px; margin-top:10px;"><br><a href="${data.image_url}" download class="btn-copy-code" style="position:static; margin-top:8px; display:inline-block;">تحميل الصورة</a>`;
+            resultDiv.innerHTML = '<img src="' + data.image_url + '" style="max-width:100%; border-radius:12px;"><br><a href="' + data.image_url + '" download class="btn-copy-code" style="position:static; margin-top:8px; display:inline-block;">تحميل</a>';
         } else {
-            resultDiv.innerHTML = `<span style="color:var(--danger)">${data.message}</span>`;
+            resultDiv.innerHTML = '<span style="color:var(--danger)">' + data.message + '</span>';
         }
     }
 
@@ -601,7 +572,7 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
         });
         const data = await res.json();
         if(data.success) {
-            document.getElementById('ttsAudioPlayer').innerHTML = `<audio controls autoplay src="${data.audio_url}" style="width:100%"></audio>`;
+            document.getElementById('ttsAudioPlayer').innerHTML = '<audio controls autoplay src="' + data.audio_url + '" style="width:100%"></audio>';
         }
     }
 
@@ -609,7 +580,7 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
         const url = document.getElementById('dlUrl').value.trim();
         const status = document.getElementById('dlStatus');
         if(!url) return;
-        status.innerHTML = '⏳ جاري تنزيل المقاطع...';
+        status.innerHTML = '⏳ جاري التنزيل...';
 
         const res = await fetch('/download', {
             method: 'POST',
@@ -618,10 +589,10 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
         });
         const data = await res.json();
         if(data.success) {
-            status.innerHTML = '<span style="color:var(--success)">تم التحميل بنجاح!</span>';
+            status.innerHTML = '<span style="color:var(--success)">تم التحميل!</span>';
             loadGallery();
         } else {
-            status.innerHTML = `<span style="color:var(--danger)">${data.message}</span>`;
+            status.innerHTML = '<span style="color:var(--danger)">' + data.message + '</span>';
         }
     }
 
@@ -632,15 +603,13 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
         gallery.innerHTML = '';
         if(data.videos) {
             data.videos.forEach(file => {
-                gallery.innerHTML += `<div style="padding:10px; background:var(--bg-primary); margin-bottom:8px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;">
-                    <span style="font-size:0.85rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:70%;">${file}</span>
-                    <a href="/download_file/${encodeURIComponent(file)}" class="btn-copy-code" style="position:static;" download>حفظ</a>
-                </div>`;
+                gallery.innerHTML += '<div style="padding:10px; background:var(--bg-primary); margin-bottom:8px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;">' +
+                    '<span style="font-size:0.85rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:70%;">' + file + '</span>' +
+                    '<a href="/download_file/' + encodeURIComponent(file) + '" class="btn-copy-code" style="position:static;" download>حفظ</a></div>';
             });
         }
     }
 
-    // دعم خيار المشاركة المباشرة (Web Share Target / URL Query)
     window.addEventListener('DOMContentLoaded', () => {
         const urlParams = new URLSearchParams(window.location.search);
         const sharedUrl = urlParams.get('url') || urlParams.get('text');
@@ -650,322 +619,209 @@ WEB_UI_TEMPLATE = """<!DOCTYPE html>
         }
         loadSessions();
     });
-</script># ==============================================================================
-# 7. المسارات البرمجية للخدمات (API Routes)
+</script>
+</body>
+</html>"""
 # ==============================================================================
+# 7. مسارات خادم FLASK (API ROUTES)
+# ==============================================================================
+
 @app.route('/')
-def index():
+def index_page():
     return WEB_UI_TEMPLATE
 
+@app.route('/manifest.json')
+def serve_manifest():
+    manifest_data = {
+        "short_name": "نظام الجبوري",
+        "name": "نظام الجبوري الذكي المتكامل",
+        "icons": [{
+            "src": "https://cdn-icons-png.flaticon.com/512/4712/4712035.png",
+            "type": "image/png",
+            "sizes": "512x512"
+        }],
+        "start_url": "/",
+        "background_color": "#0f172a",
+        "theme_color": "#0f172a",
+        "display": "standalone",
+        "orientation": "portrait",
+        "share_target": {
+            "action": "/",
+            "method": "GET",
+            "params": {
+                "title": "title",
+                "text": "text",
+                "url": "url"
+            }
+        }
+    }
+    return jsonify(manifest_data)
+
+@app.route('/sw.js')
+def serve_sw():
+    sw_code = """
+    self.addEventListener('install', (e) => {
+        self.skipWaiting();
+    });
+    self.addEventListener('fetch', (e) => {
+        e.respondWith(fetch(e.request));
+    });
+    """
+    return app.response_class(sw_code, mimetype='application/javascript')
+
 @app.route('/api/sessions', methods=['GET'])
-def get_sessions():
+def get_user_sessions():
     user_id = request.args.get('user_id', 'default_user')
     user_data = get_user_data(user_id)
-    return jsonify({'sessions': user_data.get('sessions', [])})
+    return jsonify({'success': True, 'sessions': user_data.get('sessions', [])})
 
 @app.route('/api/session/new', methods=['POST'])
-def new_session():
+def handle_new_session():
     data = request.json or {}
     user_id = data.get('user_id', 'default_user')
     session_id = create_new_chat_session(user_id)
-    return jsonify({'session_id': session_id})
+    return jsonify({'success': True, 'session_id': session_id})
 
 @app.route('/api/chat', methods=['POST'])
-def chat_api():
+def handle_chat_request():
     data = request.json or {}
     user_id = data.get('user_id', 'default_user')
     session_id = data.get('session_id')
     prompt = data.get('prompt', '').strip()
 
-    if not prompt or not session_id:
-        return jsonify({'response': 'الطلب غير مكتمل.'})
+    if not prompt:
+        return jsonify({'success': False, 'response': 'الرجاء إدخال نص الرسالة.'})
 
     user_data = get_user_data(user_id)
-    session_history = []
-    for sess in user_data.get('sessions', []):
-        if sess['session_id'] == session_id:
-            session_history = sess.get('messages', [])
-            break
+    history = []
+    if session_id:
+        for s in user_data.get('sessions', []):
+            if s['session_id'] == session_id:
+                history = s.get('messages', [])
+                break
 
-    # حفظ سؤال المستخدم
-    append_chat_message(user_id, session_id, 'user', prompt)
+    ai_response = ask_unified_ai_engine(prompt, history)
 
-    # معالجة الطلب عبر محرك الذكاء الاصطناعي
-    response_text = ask_unified_ai_engine(prompt, session_history)
+    if session_id:
+        append_chat_message(user_id, session_id, 'user', prompt)
+        append_chat_message(user_id, session_id, 'assistant', ai_response)
 
-    # حفظ إجابة النظام
-    append_chat_message(user_id, session_id, 'ai', response_text)
-
-    return jsonify({'response': response_text})
+    return jsonify({'success': True, 'response': ai_response})
 
 @app.route('/api/generate_image', methods=['POST'])
-def generate_image_api():
+def handle_image_gen():
     data = request.json or {}
     prompt = data.get('prompt', '').strip()
     if not prompt:
-        return jsonify({'success': False, 'message': 'الوصف فارغ'}), 400
+        return jsonify({'success': False, 'message': 'يرجى تقديم وصف للصورة.'})
 
-    success, image_url_or_msg = generate_image_ai(prompt)
+    success, result = generate_image_ai(prompt)
     if success:
-        return jsonify({'success': True, 'image_url': image_url_or_msg})
-    return jsonify({'success': False, 'message': image_url_or_msg})
+        return jsonify({'success': True, 'image_url': result})
+    return jsonify({'success': False, 'message': result})
 
 @app.route('/api/tts', methods=['POST'])
-def tts_api():
+def handle_tts():
     data = request.json or {}
     text = data.get('text', '').strip()
     voice = data.get('voice', 'pNInz6obpgDQGcFmaJgB')
 
     if not text:
-        return jsonify({'success': False, 'message': 'النص فارغ'})
-
-    filename = f"tts_{int(time.time())}.mp3"
-    filepath = os.path.join(DOWNLOAD_FOLDER, filename)
-
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice}"
-    headers = {"Accept": "audio/mpeg", "Content-Type": "application/json", "xi-api-key": ELEVENLABS_KEY}
-    payload = {"text": text, "model_id": "eleven_multilingual_v2"}
+        return jsonify({'success': False, 'message': 'لا يوجد نص للتحويل.'})
 
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=15)
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice}"
+        headers = {
+            "xi-api-key": ELEVENLABS_KEY,
+            "Content-Type": "application/json"
+        }
+        body = {
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+        }
+        res = requests.post(url, json=body, headers=headers, timeout=20)
         if res.status_code == 200:
+            filename = f"tts_{int(time.time())}.mp3"
+            filepath = os.path.join(DOWNLOAD_FOLDER, filename)
             with open(filepath, 'wb') as f:
                 f.write(res.content)
-            return jsonify({'success': True, 'audio_url': f'/download_file/{filename}'})
+            return jsonify({'success': True, 'audio_url': f"/download_file/{filename}"})
     except Exception:
         pass
 
-    return jsonify({'success': False, 'message': 'فشل تحويل الصوت'})
+    return jsonify({'success': False, 'message': 'فشل تحويل النص إلى صوت.'})
 
 @app.route('/download', methods=['POST'])
-def handle_video_download():
+def download_media():
     data = request.json or {}
-    url = data.get('url', '').strip()
+    media_url = data.get('url', '').strip()
+    if not media_url:
+        return jsonify({'success': False, 'message': 'الرابط غير صحيح.'})
 
-    if not url or not url.startswith('http'):
-        return jsonify({'success': False, 'message': 'يرجى تقديم رابط صالح'}), 400
-
+    out_template = os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s')
     ydl_opts = {
-        'outtmpl': os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s'),
+        'format': 'best',
+        'outtmpl': out_template,
         'quiet': True,
-        'format': 'best'
+        'no_warnings': True
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = os.path.basename(ydl.prepare_filename(info))
-            notify_admin_telegram(f"📥 <b>تم تحميل ملف جديد عبر الموقع:</b>\n<code>{filename}</code>")
-            return jsonify({'success': True, 'filename': filename})
+            ydl.download([media_url])
+        return jsonify({'success': True, 'message': 'تم التحميل بنجاح.'})
     except Exception as e:
-        return jsonify({'success': False, 'message': 'تعذر تحميل الفيديو من هذا الرابط.'}), 500
+        return jsonify({'success': False, 'message': f'خطأ أثناء التحميل: {str(e)}'})
 
-@app.route('/videos')
-def list_downloaded_videos():
-    if not os.path.exists(DOWNLOAD_FOLDER):
-        return jsonify({'videos': []})
-    allowed_exts = ('.mp4', '.mkv', '.webm', '.mp3', '.jpg', '.png')
-    files = [f for f in os.listdir(DOWNLOAD_FOLDER) if f.lower().endswith(allowed_exts)]
-    return jsonify({'success': True, 'videos': files})
+@app.route('/videos', methods=['GET'])
+def list_downloaded_media():
+    try:
+        files = os.listdir(DOWNLOAD_FOLDER)
+        files = [f for f in files if not f.startswith('.')]
+        return jsonify({'success': True, 'videos': files})
+    except Exception:
+        return jsonify({'success': True, 'videos': []})
 
-@app.route('/download_file/<path:filename>')
-def serve_download_file(filename):
+@app.route('/download_file/<path:filename>', methods=['GET'])
+def get_file_content(filename):
     return send_from_directory(DOWNLOAD_FOLDER, filename, as_attachment=True)
 
 # ==============================================================================
-# 8. البوت الرئيسي للمستخدمين على تلغرام (Main Public Telegram Bot)
+# 8. تشغيل البوتات برمجياً في الخلفية (Background Workers)
 # ==============================================================================
-main_bot = telebot.TeleBot(TELEGRAM_MAIN_TOKEN)
-
-@main_bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    user_id = message.chat.id
-    create_new_chat_session(user_id)
-    
-    markup = types.InlineKeyboardMarkup()
-    web_app_btn = types.InlineKeyboardButton(
-        text="🌐 فتح منصة الويب الموحدة", 
-        url="https://avvr.onrender.com"
-    )
-    markup.add(web_app_btn)
-    
-    welcome_text = (
-        "أهلاً بك في **نظام الجبوري الذكي**.\n\n"
-        "يمكنك التحدث معي مباشرة هنا للحصول على إجابات وأكواد برمجية، "
-        "أو إرسال رابط فيديو لتحميله، أو استخدام منصة الويب عبر الزر أدناه."
-    )
-    main_bot.reply_to(message, welcome_text, parse_mode="Markdown", reply_markup=markup)
-
-@main_bot.message_handler(func=lambda message: True)
-def handle_main_bot_messages(message):
-    user_id = message.chat.id
-    text = message.text.strip() if message.text else ""
-
-    if not text:
-        return
-
-    # كشف روابط التحميل المباشر
-    if re.match(r'^(https?://[^\s]+)', text):
-        msg = main_bot.reply_to(message, "⏳ جاري معالجة التحميل...")
+def run_telegram_bots():
+    def start_main_bot():
         try:
-            ydl_opts = {
-                'outtmpl': os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s'),
-                'quiet': True,
-                'format': 'best'
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(text, download=True)
-                filepath = ydl.prepare_filename(info)
-                filename = os.path.basename(filepath)
-                
-                with open(filepath, 'rb') as f:
-                    main_bot.send_document(user_id, f, caption=f"✅ تم التحميل: {filename}")
-                main_bot.delete_message(user_id, msg.message_id)
-                notify_admin_telegram(f"📥 <b>تم تحميل مقطع عبر البوت الرئيسي:</b>\n<code>{filename}</code>")
-        except Exception:
-            main_bot.edit_message_text("❌ تعذر تحميل هذا الرابط. تأكد من صحته والمحاولة لاحقاً.", user_id, msg.message_id)
-        return
+            bot = telebot.TeleBot(TELEGRAM_MAIN_TOKEN)
+            @bot.message_handler(func=lambda m: True)
+            def echo_all(msg):
+                resp = ask_unified_ai_engine(msg.text)
+                bot.reply_to(msg, resp)
+            bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        except Exception as e:
+            print(f"توقف البوت الرئيسي: {str(e)}")
 
-    # معالجة استفسارات الذكاء الاصطناعي
-    user_data = get_user_data(user_id)
-    active_session = user_data.get("active_session_id")
-    if not active_session:
-        active_session = create_new_chat_session(user_id)
-
-    history = []
-    for sess in user_data.get("sessions", []):
-        if sess["session_id"] == active_session:
-            history = sess.get("messages", [])
-            break
-
-    append_chat_message(user_id, active_session, "user", text)
-    main_bot.send_chat_action(user_id, 'typing')
-
-    ai_response = ask_unified_ai_engine(text, history)
-    append_chat_message(user_id, active_session, "ai", ai_response)
-
-    main_bot.reply_to(message, ai_response)
-
-# ==============================================================================
-# 9. بوت لوحة تحكم المطور الخاص بك (Admin Control Bot)
-# ==============================================================================
-admin_bot = telebot.TeleBot(TELEGRAM_ADMIN_TOKEN)
-
-def is_admin(user_id):
-    return int(user_id) == ADMIN_ID
-
-@admin_bot.message_handler(commands=['start', 'admin'])
-def admin_start(message):
-    if not is_admin(message.chat.id):
-        return
-
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    btn_stats = types.KeyboardButton("📊 الإحصائيات العامة")
-    btn_bans = types.KeyboardButton("🛡️ إدارة قائمة الحظر (IP)")
-    btn_unban = types.KeyboardButton("🔓 فك حظر IP")
-    btn_status = types.KeyboardButton("🟢 حالة الخادم")
-    markup.add(btn_stats, btn_bans, btn_unban, btn_status)
-
-    admin_bot.send_message(
-        message.chat.id,
-        "<b>مرحباً بك في لوحة تحكم مطور نظام الجبوري</b>\nاختر من القائمة أدناه لإدارة النظام بسهولة:",
-        parse_mode="HTML",
-        reply_markup=markup
-    )
-
-@admin_bot.message_handler(func=lambda message: is_admin(message.chat.id))
-def handle_admin_commands(message):
-    text = message.text
-
-    if text == "📊 الإحصائيات العامة":
-        bans = load_json_file(BANS_FILE, {})
-        db = load_json_file(CHAT_DB_FILE, {})
-        total_users = len(db)
-        banned_count = len(bans)
-        
-        files = os.listdir(DOWNLOAD_FOLDER) if os.path.exists(DOWNLOAD_FOLDER) else []
-        
-        stats_msg = (
-            f"📊 <b>إحصائيات نظام الجبوري:</b>\n\n"
-            f"👥 <b>إجمالي المستخدمين:</b> {total_users}\n"
-            f"📁 <b>عدد الملفات المحملة:</b> {len(files)}\n"
-            f"🚫 <b>العناوين المحظورة حالياً (IP):</b> {banned_count}\n"
-        )
-        admin_bot.send_message(message.chat.id, stats_msg, parse_mode="HTML")
-
-    elif text == "🛡️ إدارة قائمة الحظر (IP)":
-        bans = load_json_file(BANS_FILE, {})
-        if not bans:
-            admin_bot.send_message(message.chat.id, "✅ لا يوجد أي عنوان IP محظور حالياً.")
-            return
-
-        msg = "🚫 <b>قائمة عناوين IP المحظورة تلقائياً:</b>\n\n"
-        now = time.time()
-        for ip, unban_t in bans.items():
-            rem_mins = max(0, int((unban_t - now) / 60))
-            msg += f"• <code>{ip}</code> (متبقي: {rem_mins} دقيقة)\n"
-        admin_bot.send_message(message.chat.id, msg, parse_mode="HTML")
-
-    elif text == "🔓 فك حظر IP":
-        msg = admin_bot.send_message(message.chat.id, "أرسل عنوان IP الذي تريد فك الحظر عنه:")
-        admin_bot.register_next_step_handler(msg, process_unban_ip)
-
-    elif text == "🟢 حالة الخادم":
-        admin_bot.send_message(
-            message.chat.id,
-            "🟢 <b>جميع الخدمات تعمل بكفاءة:</b>\n"
-            "• خادم Flask والواجهة: نشط\n"
-            "• محرك الذكاء الاصطناعي: متصل\n"
-            "• البوت الرئيسي وبوت الأدمن: قيد التشغيل",
-            parse_mode="HTML"
-        )
-
-def process_unban_ip(message):
-    ip_to_unban = message.text.strip()
-    bans = load_json_file(BANS_FILE, {})
-    if ip_to_unban in bans:
-        del bans[ip_to_unban]
-        save_json_file(BANS_FILE, bans)
-        admin_bot.send_message(message.chat.id, f"✅ تم فك الحظر بنجاح عن IP: <code>{ip_to_unban}</code>", parse_mode="HTML")
-    else:
-        admin_bot.send_message(message.chat.id, "❌ العنوان غير موجود في قائمة الحظر.")
-
-# ==============================================================================
-# 10. التشغيل المتوازي والمتزامن لجميع الخدمات (Multi-Threading Engine)
-# ==============================================================================
-def run_flask():
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
-
-def run_main_bot():
-    while True:
+    def start_admin_bot():
         try:
-            main_bot.polling(none_stop=True, interval=1, timeout=30)
-        except Exception:
-            time.sleep(3)
+            admin_bot = telebot.TeleBot(TELEGRAM_ADMIN_TOKEN)
+            @admin_bot.message_handler(commands=['stats'])
+            def show_stats(msg):
+                if msg.from_user.id == ADMIN_ID:
+                    admin_bot.reply_to(msg, "📊 **النظام يعمل بنجاح على سيرفر Render.**")
+            admin_bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        except Exception as e:
+            print(f"توقف بوت الإدارة: {str(e)}")
 
-def run_admin_bot():
-    while True:
-        try:
-            admin_bot.polling(none_stop=True, interval=1, timeout=30)
-        except Exception:
-            time.sleep(3)
+    threading.Thread(target=start_main_bot, daemon=True).start()
+    threading.Thread(target=start_admin_bot, daemon=True).start()
 
+# تشغيل البوتات فور استدعاء الملف
+run_telegram_bots()
+
+# ==============================================================================
+# 9. نقطة الإدخال للتأكد من العمل في بيئة الإنتاج المحلي وRender
+# ==============================================================================
 if __name__ == '__main__':
-    # تشغيل خادم Flask في خلفية مستقلة
-    t_flask = threading.Thread(target=run_flask)
-    t_flask.daemon = True
-    t_flask.start()
-
-    # تشغيل البوت الرئيسي في خلفية مستقلة
-    t_main_bot = threading.Thread(target=run_main_bot)
-    t_main_bot.daemon = True
-    t_main_bot.start()
-
-    # إرسال إشعار للمطور عند تشغيل السيرفر
-    notify_admin_telegram("🚀 <b>تم تشغيل نظام الجبوري الذكي بنجاح بكافة واجهاته وبوتاته.</b>")
-
-    # تشغيل بوت لوحة التحكم في الخيط الرئيسي
-    run_admin_bot()
-</body>
-</html>"""
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)

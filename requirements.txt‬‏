@@ -1,5 +1,5 @@
+flask
+flask-cors
+yt-dlp
 pyTelegramBotAPI
 requests
-yt-dlp
-Flask
-gunicorn

@@ -1,5 +1,4 @@
-flask
+Flask
 flask-cors
-yt-dlp
-pyTelegramBotAPI
 requests
+yt-dlp

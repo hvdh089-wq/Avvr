@@ -11,7 +11,7 @@ from flask import Flask
 MAIN_TOKEN = "8670100497:AAGoCnO6beXj9HIi2lNucddCPOLKxZHMiJc"
 ADMIN_TOKEN = "8758801132:AAESDdtWE3iStnnfjtyXQhvHMzL-bzHqNR8"
 ADMIN_ID = 8301511694
-ELEVENLABS_API_KEY = "sk_6e423b917963e592ef1d6941b9c58d941ccb45adaeb966c7"
+ELEVENLABS_API_KEY = "sk_7770bfbb6c5692dcc1ae2fe0d4516465cdf4acf0bddaa368"
 
 main_bot = telebot.TeleBot(MAIN_TOKEN)
 admin_bot = telebot.TeleBot(ADMIN_TOKEN)
@@ -250,3 +250,4 @@ if __name__ == "__main__":
     
     # 3. تشغيل البوت الرئيسي في المسار الأساسي
     main_bot.infinity_polling()
+    

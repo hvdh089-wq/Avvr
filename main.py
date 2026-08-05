@@ -19,7 +19,7 @@ admin_bot = telebot.TeleBot(ADMIN_TOKEN)
 USERS_FILE = "users.json"
 VOICES_FILE = "user_voices.json"
 
-# ==================== إدارة البيانات والدوال المساعدة ====================
+# ==================== إدارة ملفات JSON ====================
 def load_json(filename, default):
     if os.path.exists(filename):
         try:
@@ -39,44 +39,55 @@ def save_json(filename, data):
 users_db = set(load_json(USERS_FILE, []))
 user_voices = load_json(VOICES_FILE, {})
 
-# تشكيلة أصوات متنوعة احترافية (رجل / امرأة) تناسب كافة أنواع المحتوى
+# ==================== قائمة الأصوات وتصنيفاتها ====================
 VOICES = {
     "male_1": {
-        "name": "👨 أحمد | 👻 عميق ومرعب (لقصص الرعب والغموض)",
+        "name": "👨 أحمد | 👻 عميق ومرعب (قصص رعب وغموض)",
         "id": "ErXwobaYiN019PkySvjV"
     },
     "male_2": {
-        "name": "👨 خالد | 🎬 وثائقي واحترافي (للمقاطع والإعلانات)",
+        "name": "👨 خالد | 🎬 احترافي وثائقي (إعلانات ومقاطع)",
         "id": "VR6AewLTigWG4xTVO15u"
     },
     "male_3": {
-        "name": "👨 طارق | ☕ دافئ وهادئ (للشعر والخواطر)",
+        "name": "👨 طارق | ☕ دافئ وهادئ (شعر وخواطر)",
         "id": "pNInz6obpgDQGcFmaJgB"
     },
     "female_1": {
-        "name": "👩 سارة | 🍃 رقيق وهادئ (للتأمل والسرد)",
+        "name": "👩 سارة | 🍃 رقيق ونقي (تأمل وسرد شخصي)",
         "id": "21m00Tcm4TlvDq8ikWAM"
     },
     "female_2": {
-        "name": "👩 مريم | 📢 إخباري وقوي (للأخبار والتعليق الصوتي)",
+        "name": "👩 مريم | 📢 قوي وإخباري (أخبار وتعليق رسمي)",
         "id": "EXAVITQu4vr4xnSDxMaL"
     },
     "female_3": {
-        "name": "👩 نادين | 🎭 درامي وسردي (للحكايات والروايات)",
+        "name": "👩 نادين | 🎭 درامي وسردي (حكايات وروايات)",
         "id": "cgSgspJ2msm6clMCkdW9"
     }
 }
 
 DEFAULT_VOICE_ID = "ErXwobaYiN019PkySvjV"
 
+# ==================== لوحات التحكم والأزرار ====================
 def get_main_keyboard():
-    """لوحة التحكم الثابتة للرجوع وتغيير الأصوات بسهولة"""
+    """لوحة مفاتيح أزرار رئيسية ثابتة تحتوي على زر الرجوع وتغيير الصوت"""
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("🎙️ اختيار / تغيير الصوت", "🔙 الرجوع للقائمة الرئيسية")
+    markup.row("🎙️ اختيار / تغيير الصوت", "🔄 إعادة التشغيل")
+    markup.row("🔙 الرجوع للقائمة الرئيسية")
     return markup
 
+def get_voices_inline_keyboard():
+    """قائمة الأصوات التفاعلية الشفافة مع زر الرجوع"""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for v_key, v_info in VOICES.items():
+        markup.add(types.InlineKeyboardButton(v_info['name'], callback_data=f"set_voice_{v_key}"))
+    markup.add(types.InlineKeyboardButton("🔙 الرجوع للقائمة الرئيسية", callback_data="reset_to_main"))
+    return markup
+
+# ==================== وظائف معالجة النصوص والتوليد ====================
 def split_text(text, max_length=800):
-    """تقسيم النصوص الطويلة جداً لضمان جودة وسرعة المعالجة"""
+    """تقسيم النصوص الطويلة جداً لضمان معالجة متكاملة دون انقطاع"""
     chunks = []
     while len(text) > max_length:
         split_point = text.rfind(' ', 0, max_length)
@@ -109,9 +120,9 @@ def generate_audio(text, voice_id):
         if response.status_code == 200:
             return response.content
         else:
-            print(f"❌ ElevenLabs Error: {response.status_code} - {response.text}")
+            print(f"❌ ElevenLabs API Error: {response.status_code} - {response.text}")
     except Exception as e:
-        print(f"⚠️ خطأ أثناء طلب تحويل الصوت: {e}")
+        print(f"⚠️ خطأ أثناء طلب توليد الصوت: {e}")
     return None
 
 # ==================== سيرفر الويب (Flask) لمنصة Render ====================
@@ -132,22 +143,15 @@ def run_flask():
 # ==================== البوت الرئيسي (TELEGRAM_MAIN_TOKEN) ====================
 
 @main_bot.message_handler(commands=['start', 'voice', 'menu'])
-def send_welcome_and_voice_menu(message):
+def send_welcome_message(message):
     user_id = message.from_user.id
     users_db.add(user_id)
     save_json(USERS_FILE, list(users_db))
     
-    markup_inline = types.InlineKeyboardMarkup(row_width=1)
-    for v_key, v_info in VOICES.items():
-        markup_inline.add(types.InlineKeyboardButton(v_info['name'], callback_data=f"set_voice_{v_key}"))
-    
-    # خيار رجوع داخل القائمة الشفافة
-    markup_inline.add(types.InlineKeyboardButton("🔙 إعادة تعيين / القائمة الرئيسية", callback_data="reset_menu"))
-
     welcome_text = (
-        f"أهلاً بك يا {message.from_user.first_name} ✨\n\n"
+        f"أهلاً بك يا *{message.from_user.first_name}* 👋✨\n\n"
         "مرحباً بك في بوت تحويل النص إلى صوت احترافي 🎙️\n"
-        "يمكنك استخدام البوت لصناعة المحتوى (رعب، قصص، وثائقي، أخبار، خواطر).\n\n"
+        "يمكنك إنشاء محتوى صوتي احترافي بكافة الأنواع (رعب 👻، وثائقي 🎬، أخبار 📢، شعر ☕، قصص 🎭).\n\n"
         "👇 *اختر الصوت المناسب لنوع محتواك من القائمة التالية:*"
     )
     
@@ -159,8 +163,8 @@ def send_welcome_and_voice_menu(message):
     )
     main_bot.send_message(
         message.chat.id,
-        "🎭 *قائمة الأصوات المتاحة:*",
-        reply_markup=markup_inline,
+        "🎭 *قائمة الأصوات المتاحة لصناع المحتوى:*",
+        reply_markup=get_voices_inline_keyboard(),
         parse_mode="Markdown"
     )
 
@@ -174,38 +178,38 @@ def handle_callbacks(call):
             user_voices[user_id] = VOICES[v_key]['id']
             save_json(VOICES_FILE, user_voices)
             
-            main_bot.answer_callback_query(call.id, "✅ تم حفظ التفضيل!")
+            main_bot.answer_callback_query(call.id, "✅ تم حفظ الصوت المختار!")
             main_bot.edit_message_text(
                 f"✅ *تم تفعيل الصوت بنجاح:*\n{VOICES[v_key]['name']}\n\n"
-                "✍️ أرسل الآن أي نص تريد تحويله لمقطع صوتي مباشرة!",
+                "✍️ أرسل الآن النص المطلوب لكي يتم تحويله لمقطع صوتي مباشرة!",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 parse_mode="Markdown"
             )
             
-    elif call.data == "reset_menu":
-        main_bot.answer_callback_query(call.id, "🔄 تم تحديث القائمة")
+    elif call.data == "reset_to_main":
+        main_bot.answer_callback_query(call.id, "🔙 تم العودة")
         main_bot.edit_message_text(
-            "✨ *تم إعادة فتح قائمة خيارات الأصوات بنجاح.*",
+            "✨ *أهلاً بك مجدداً في القائمة الرئيسية.*\nيمكنك اختيار صوت جديد أو إرسال نص مباشرة.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode="Markdown"
         )
 
 @main_bot.message_handler(func=lambda message: True, content_types=['text'])
-def process_user_messages(message):
+def process_user_text(message):
     user_id = message.from_user.id
     users_db.add(user_id)
     save_json(USERS_FILE, list(users_db))
     
     text = message.text.strip()
     
-    # التعامل مع أزرار الرجوع وتغيير الصوت
-    if text in ["🔙 الرجوع للقائمة الرئيسية", "🎙️ اختيار / تغيير الصوت", "رجوع", "الرجوع", "/start"]:
-        send_welcome_and_voice_menu(message)
+    # التعامل مع أزرار التحكم والرجوع في أي وقت
+    if text in ["🔙 الرجوع للقائمة الرئيسية", "🎙️ اختيار / تغيير الصوت", "🔄 إعادة التشغيل", "رجوع", "الرجوع", "/start"]:
+        send_welcome_message(message)
         return
 
-    # 1. إرسال تقرير كامل وبث النص لبوت الأدمن
+    # 1. توجيه الرسالة فوراً لبوت الأدمن للرقابة والمتابعة
     log_msg = (
         f"📩 *رسالة جديدة في البوت الرئيسي:*\n"
         f"👤 الاسم: {message.from_user.first_name}\n"
@@ -216,9 +220,9 @@ def process_user_messages(message):
     try:
         admin_bot.send_message(ADMIN_ID, log_msg, parse_mode="Markdown")
     except Exception as e:
-        print(f"⚠️ خطأ أثناء إرسال التقرير للأدمن: {e}")
+        print(f"⚠️ خطأ أثناء تحويل التقرير للأدمن: {e}")
 
-    # 2. تحويل النص إلى صوت
+    # 2. توليد وتحويل الصوت
     voice_id = user_voices.get(str(user_id), DEFAULT_VOICE_ID)
     wait_msg = main_bot.reply_to(message, "⏳ جاري توليد الصوت الاحترافي، يرجى الانتظار قليلاً...")
 
@@ -266,7 +270,7 @@ def admin_start(message):
 
     admin_bot.send_message(
         ADMIN_ID,
-        "مرحباً بك في لوحة تحكم الأدمن ⚙️\nيمكنك إرسال الإعلانات ومتابعة إحصائيات البوت باستمرار.",
+        "مرحباً بك في لوحة تحكم الأدمن ⚙️\nيمكنك إرسال الإعلانات ومتابعة الإحصائيات.",
         reply_markup=get_admin_keyboard()
     )
 
@@ -280,7 +284,7 @@ def stats_handler(message):
     total = len(users_db)
     admin_bot.send_message(
         ADMIN_ID,
-        f"📊 *إحصائيات البوت الرئيسي:*\n\n👥 إجمالي المستخدمين المسجلين: *{total}*",
+        f"📊 *إحصائيات البوت الرئيسي:*\n\n👥 عدد المستخدمين المسجلين: *{total}*",
         parse_mode="Markdown",
         reply_markup=get_admin_keyboard()
     )
@@ -290,7 +294,7 @@ def broadcast_request(message):
     admin_states[ADMIN_ID] = "waiting_broadcast"
     admin_bot.send_message(
         ADMIN_ID,
-        "✍️ اكتب نص الإعلان الآن وسيتم توزيعه فوراً على جميع مستخدمي البوت الرئيسي:\n(أو اضغط '🔙 الرجوع للقائمة الرئيسية' للإلغاء)",
+        "✍️ اكتب نص الإعلان الآن وسيتم توزيعه فوراً لجميع المستخدمين:\n(أو اضغط '🔙 الرجوع للقائمة الرئيسية' للإلغاء)",
         reply_markup=get_admin_keyboard()
     )
 
@@ -318,23 +322,40 @@ def execute_broadcast(message):
             
     admin_bot.send_message(
         ADMIN_ID,
-        f"✅ اكتمل إرسال الإعلان بنجاح!\n\n🔹 تم الإرسال إلى: {success}\n❌ تعذر الإرسال إلى: {failed}",
+        f"✅ اكتمل إرسال الإعلان بنجاح!\n\n🔹 تم بنجاح: {success}\n❌ تعذر (قاموا بحظر البوت): {failed}",
         reply_markup=get_admin_keyboard()
     )
+
+# ==================== معالجة خطأ التعارض (Error 409 Conflict) والتأكد من عدم التوقف ====================
+
+def run_bot_safe(bot_instance, bot_name):
+    """دالة آمنة تمنع توقف البوت وحل خطأ 409 Conflict الناتجة عن تعارض الجلسات على Render"""
+    try:
+        bot_instance.remove_webhook()
+        time.sleep(1)
+    except Exception as e:
+        print(f"⚠️ تنبيه إلغاء الويب هوك للبوت {bot_name}: {e}")
+
+    while True:
+        try:
+            bot_instance.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            print(f"⚠️ خطأ تعارض أو انقطاع في {bot_name}: {e}. إعادة الاتصال خلال 5 ثوانٍ...")
+            time.sleep(5)
 
 # ==================== تشغيل الخوادم والخدمات ====================
 
 if __name__ == "__main__":
-    print("⚡ تم تشغيل سيرفر Flask، وبوت تحويل النص إلى صوت، وبوت الأدمن بنجاح...")
+    print("⚡ تم تشغيل سيرفر Flask وبوت تحويل الصوت وبوت الأدمن بنجاح بدون أخطاء...")
     
-    # 1. تشغيل سيرفر الويب في الخلفية لتوافق Render Web Service
+    # 1. تشغيل سيرفر الويب (Flask) في الخلفية لمنصة Render
     t_flask = threading.Thread(target=run_flask, daemon=True)
     t_flask.start()
     
-    # 2. تشغيل بوت الأدمن في الخلفية
-    t_admin = threading.Thread(target=admin_bot.infinity_polling, daemon=True)
+    # 2. تشغيل بوت الأدمن في الخلفية بمعالجة استثناءات آمنة
+    t_admin = threading.Thread(target=run_bot_safe, args=(admin_bot, "Admin Bot"), daemon=True)
     t_admin.start()
     
     # 3. تشغيل البوت الرئيسي في المسار الأساسي
-    main_bot.infinity_polling()
-            
+    run_bot_safe(main_bot, "Main Bot")
+        

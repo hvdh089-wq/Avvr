@@ -5,6 +5,7 @@ import threading
 import requests
 import telebot
 from telebot import types
+from flask import Flask
 
 # --- البيانات والمفاتيح ---
 MAIN_TOKEN = "8670100497:AAGoCnO6beXj9HIi2lNucddCPOLKxZHMiJc"
@@ -20,16 +21,19 @@ VOICES_FILE = "user_voices.json"
 
 def load_json(filename, default):
     if os.path.exists(filename):
-        with open(filename, "r", encoding="utf-8") as f:
-            try:
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
                 return json.load(f)
-            except Exception:
-                return default
+        except Exception:
+            return default
     return default
 
 def save_json(filename, data):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Error saving {filename}: {e}")
 
 users_db = set(load_json(USERS_FILE, []))
 user_voices = load_json(VOICES_FILE, {})
@@ -75,10 +79,31 @@ def generate_audio(text, voice_id):
             "similarity_boost": 0.80
         }
     }
-    response = requests.post(url, json=data, headers=headers)
-    if response.status_code == 200:
-        return response.content
+    try:
+        response = requests.post(url, json=data, headers=headers, timeout=60)
+        if response.status_code == 200:
+            return response.content
+        else:
+            print(f"ElevenLabs error: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"TTS Request Exception: {e}")
     return None
+
+# ==================== سيرفر الويب (Flask) لإبقاء الخدمة نشطة على Render ====================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is active and running 24/7 on Render!", 200
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
+def run_flask():
+    # Render يمرر البورت تلقائياً عبر متغير البيئة PORT
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 # ==================== البوت الرئيسي (TELEGRAM_MAIN_TOKEN) ====================
 
@@ -210,14 +235,18 @@ def execute_broadcast(message):
             
     admin_bot.send_message(ADMIN_ID, f"✅ اكتمل الإرسال!\n\n🔹 تم بنجاح: {success}\n❌ تعذر (قاموا بحظر البوت): {failed}")
 
-# ==================== تشغيل الخادمين ====================
+# ==================== تشغيل الخوادم ====================
 
 if __name__ == "__main__":
-    print("⚡ تم تشغيل بوت تحويل الصوت وبوت الأدمن بنجاح...")
+    print("⚡ تم تشغيل سيرفر Flask وبوت تحويل الصوت وبوت الأدمن بنجاح...")
     
-    # تشغيل بوت الأدمن في الخلفية
-    t = threading.Thread(target=admin_bot.infinity_polling, daemon=True)
-    t.start()
+    # 1. تشغيل سيرفر الويب (Flask) لإكتمال شروط Render Web Service
+    t_flask = threading.Thread(target=run_flask, daemon=True)
+    t_flask.start()
     
-    # تشغيل البوت الرئيسي
+    # 2. تشغيل بوت الأدمن في الخلفية
+    t_admin = threading.Thread(target=admin_bot.infinity_polling, daemon=True)
+    t_admin.start()
+    
+    # 3. تشغيل البوت الرئيسي في المسار الأساسي
     main_bot.infinity_polling()

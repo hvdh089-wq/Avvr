@@ -1,4 +1,4 @@
+pyTelegramBotAPI
+edge-tts
 Flask
-flask-cors
-requests
-yt-dlp
+gunicorn

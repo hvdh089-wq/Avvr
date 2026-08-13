@@ -26,7 +26,7 @@ DEVELOPER_NAME = "المطور الجبوري"
 DEVELOPER_RIGHTS = "\n\n👑 **تطوير:** المطور الجبوري"
 
 # مفاتيح الربط
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8965727379:AAF2x-CTFF7MgttvUgHqOBvKyVkuekO6pIY")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8638334231:AAEZr_3sZ3jbQKg_Syq04CgOnXDWvbTWLdg")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6KeiWbeu1PlIgMdPEe8ecmVYnnIbbwQScl-0IRhWvCUpw")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "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")
 GITHUB_USER = os.environ.get("GITHUB_USER", "akoasad7-arch")

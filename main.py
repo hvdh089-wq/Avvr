@@ -17,6 +17,7 @@ import zipfile
 from flask import Flask, render_template_string, request, jsonify
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.apihelper import ApiTelegramException
 from gtts import gTTS
 import qrcode
 
@@ -242,7 +243,6 @@ def process_ai_chat(user_id, prompt):
     
     if GEMINI_API_KEY:
         try:
-            # استخدام الموديل المستقر المحدث Gemini 2.5 Flash
             url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent"
             headers = {
                 "Content-Type": "application/json",
@@ -335,7 +335,6 @@ HTML_TEMPLATE = """
             flex-direction: column;
         }
 
-        /* Navbar */
         .navbar {
             background: var(--card-bg);
             border-bottom: 1px solid var(--card-border);
@@ -373,7 +372,6 @@ HTML_TEMPLATE = """
             border: 1px solid rgba(99, 102, 241, 0.3);
         }
 
-        /* Container & Tabs */
         .container {
             max-width: 1200px;
             margin: 2rem auto;
@@ -416,7 +414,6 @@ HTML_TEMPLATE = """
             border-bottom: 2px solid var(--accent-color);
         }
 
-        /* Sections */
         .tab-content {
             display: none;
         }
@@ -425,7 +422,6 @@ HTML_TEMPLATE = """
             display: block;
         }
 
-        /* Cards Grid */
         .grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -451,7 +447,6 @@ HTML_TEMPLATE = """
             font-weight: 700;
         }
 
-        /* Forms & Inputs */
         textarea, input, select {
             width: 100%;
             background: var(--bg-color);
@@ -488,15 +483,6 @@ HTML_TEMPLATE = """
             background: var(--accent-hover);
         }
 
-        .btn-danger {
-            background: var(--danger);
-        }
-
-        .btn-danger:hover {
-            background: #dc2626;
-        }
-
-        /* Response Box */
         .response-box {
             background: var(--bg-color);
             border: 1px solid var(--card-border);
@@ -537,17 +523,6 @@ HTML_TEMPLATE = """
             font-size: 0.85rem;
             background: var(--card-bg);
         }
-
-        @media (max-width: 768px) {
-            .navbar {
-                flex-direction: column;
-                gap: 10px;
-                text-align: center;
-            }
-            .tabs {
-                justify-content: flex-start;
-            }
-        }
     </style>
 </head>
 <body>
@@ -564,52 +539,22 @@ HTML_TEMPLATE = """
 
     <div class="container">
         <div class="tabs">
-            <button class="tab-btn active" onclick="switchTab('hosting')">
-                <svg class="svg-icon" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
-                نشر الأكواد والمواقع
-            </button>
-            <button class="tab-btn" onclick="switchTab('ai')">
-                <svg class="svg-icon" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z"/><circle cx="12" cy="12" r="3"/></svg>
-                الذكاء الاصطناعي (Gemini 2.5)
-            </button>
-            <button class="tab-btn" onclick="switchTab('cyber')">
-                <svg class="svg-icon" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-                الأمن السيبراني والشبكات
-            </button>
-            <button class="tab-btn" onclick="switchTab('tools')">
-                <svg class="svg-icon" viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
-                الأدوات العامة
-            </button>
+            <button class="tab-btn active" onclick="switchTab('hosting')">نشر الأكواد والمواقع</button>
+            <button class="tab-btn" onclick="switchTab('ai')">الذكاء الاصطناعي (Gemini 2.5)</button>
+            <button class="tab-btn" onclick="switchTab('cyber')">الأمن السيبراني والشبكات</button>
+            <button class="tab-btn" onclick="switchTab('tools')">الأدوات العامة</button>
         </div>
 
         <div id="hosting" class="tab-content active">
             <div class="grid">
                 <div class="card">
                     <div class="card-header">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
                         <span>تحويل كود HTML / CSS / JS إلى رابط مباشر</span>
                     </div>
                     <input type="text" id="custom_name" placeholder="اسم رابط الموقع (اختياري مثلاً: my-site)">
                     <textarea id="web_code" rows="10" placeholder="الصق كود HTML هنا..."></textarea>
-                    <button class="btn" onclick="publishCode()">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-                        نشر الموقع على الإنترنت
-                    </button>
+                    <button class="btn" onclick="publishCode()">نشر الموقع على الإنترنت</button>
                     <div id="publish_result"></div>
-                </div>
-
-                <div class="card">
-                    <div class="card-header">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                        <span>رفع مشروع كامل (ملف ZIP)</span>
-                    </div>
-                    <p style="font-size: 0.85rem; color: var(--text-muted);">قم بضغط ملفات موقعك (index.html, CSS, الصور) داخل ملف ZIP ورفعه مباشرة:</p>
-                    <input type="file" id="zip_file" accept=".zip">
-                    <button class="btn" onclick="publishZip()">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/></svg>
-                        رفع ونشر ZIP
-                    </button>
-                    <div id="zip_result"></div>
                 </div>
             </div>
         </div>
@@ -617,7 +562,6 @@ HTML_TEMPLATE = """
         <div id="ai" class="tab-content">
             <div class="card">
                 <div class="card-header">
-                    <svg class="svg-icon" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
                     <span>شاشة محادثة Gemini 2.5 Flash</span>
                 </div>
                 <div id="ai_chat_box" class="response-box" style="height: 300px;"></div>
@@ -632,7 +576,6 @@ HTML_TEMPLATE = """
             <div class="grid">
                 <div class="card">
                     <div class="card-header">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
                         <span>فحص الـ IP والـ DNS</span>
                     </div>
                     <input type="text" id="cyber_input" placeholder="أدخل IP أو اسم الدومين (مثلاً google.com)">
@@ -643,19 +586,6 @@ HTML_TEMPLATE = """
                     </div>
                     <div id="cyber_result" class="response-box"></div>
                 </div>
-
-                <div class="card">
-                    <div class="card-header">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-                        <span>مولد التشفيرات وكلمات السر</span>
-                    </div>
-                    <input type="text" id="hash_input" placeholder="أدخل النص للتشفير">
-                    <div style="display: flex; gap: 10px;">
-                        <button class="btn" onclick="generateHash()">تشفير MD5 / SHA256</button>
-                        <button class="btn" onclick="generatePass()">توليد كلمة سر قوية</button>
-                    </div>
-                    <div id="hash_result" class="response-box"></div>
-                </div>
             </div>
         </div>
 
@@ -663,7 +593,6 @@ HTML_TEMPLATE = """
             <div class="grid">
                 <div class="card">
                     <div class="card-header">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
                         <span>اختصار الروابط وتوليد باركود QR</span>
                     </div>
                     <input type="text" id="tool_url" placeholder="أدخل الرابط الطويل هنا...">
@@ -675,7 +604,6 @@ HTML_TEMPLATE = """
                 </div>
             </div>
         </div>
-
     </div>
 
     <footer>
@@ -743,21 +671,6 @@ HTML_TEMPLATE = """
             resBox.innerText = data.result;
         }
 
-        async function generateHash() {
-            const val = document.getElementById('hash_input').value;
-            const resBox = document.getElementById('hash_result');
-            const resp = await fetch(`/api/tools/hash?text=${encodeURIComponent(val)}`);
-            const data = await resp.json();
-            resBox.innerText = data.result;
-        }
-
-        async function generatePass() {
-            const resBox = document.getElementById('hash_result');
-            const resp = await fetch(`/api/tools/pass`);
-            const data = await resp.json();
-            resBox.innerText = 'كلمة السر المولدة: ' + data.result;
-        }
-
         async function shortenUrl() {
             const url = document.getElementById('tool_url').value;
             const resBox = document.getElementById('tool_result');
@@ -794,7 +707,7 @@ def api_publish():
     live_url, sha, err = publish_file_to_github(filename, code.encode('utf-8'))
     
     if live_url:
-        add_user_site(1000, filename, live_url, sha) # 1000 للمستخدمين عبر الويب
+        add_user_site(1000, filename, live_url, sha)
         return jsonify({"status": "success", "url": live_url})
     return jsonify({"status": "error", "message": err})
 
@@ -823,18 +736,6 @@ def api_cyber():
     else:
         out = "أداة غير معروفة."
     return jsonify({"result": out})
-
-@app.route('/api/tools/hash')
-def api_hash():
-    text = request.args.get('text', '')
-    md5 = hashlib.md5(text.encode()).hexdigest()
-    sha256 = hashlib.sha256(text.encode()).hexdigest()
-    return jsonify({"result": f"MD5:\n{md5}\n\nSHA256:\n{sha256}"})
-
-@app.route('/api/tools/pass')
-def api_pass():
-    pwd = ''.join(random.choices(string.ascii_letters + string.digits + "!@#$%^&*", k=16))
-    return jsonify({"result": pwd})
 
 @app.route('/api/tools/shorten')
 def api_shorten():
@@ -906,13 +807,11 @@ def handle_incoming_content(message):
             execute_publishing_process(chat_id, pending_codes[chat_id]['message_id'])
         return
 
-    # إذا كان المستخدم في وضع أداة تليجرام عادية
     state = user_states.get(chat_id)
     if state and state.startswith("tool_"):
         process_telegram_tool(message, state)
         return
 
-    # معالجة رفع الملفات والأكواد للنشر
     code_content = ""
     is_zip = False
     file_bytes = None
@@ -930,7 +829,6 @@ def handle_incoming_content(message):
         code_content = message.text
         file_bytes = code_content.encode('utf-8')
     else:
-        # إذا نص عادي بدون اختيار أداة، قم بتوجيهه للذكاء الاصطناعي تلقائياً
         ans = process_ai_chat(chat_id, message.text)
         bot.reply_to(message, f"🤖 **Gemini 2.5:**\n\n{ans}{DEVELOPER_RIGHTS}")
         return
@@ -1029,7 +927,7 @@ def process_telegram_tool(message, state):
     if state == "tool_ip_info":
         res = requests.get(f"http://ip-api.com/json/{text}").json()
         if res.get('status') == 'success':
-            bot.send_message(chat_id, f"🌐 **بيانات ה-IP:**\nالدولة: {res.get('country')}\nالمدينة: {res.get('city')}\nالمزود: {res.get('isp')}")
+            bot.send_message(chat_id, f"🌐 **بيانات IP:**\nالدولة: {res.get('country')}\nالمدينة: {res.get('city')}\nالمزود: {res.get('isp')}")
         else:
             bot.send_message(chat_id, "❌ متعذر جلب بيانات هذا الـ IP.")
 
@@ -1038,11 +936,11 @@ def process_telegram_tool(message, state):
         bio = io.BytesIO()
         img.save(bio, 'PNG')
         bio.seek(0)
-        bot.send_photo(chat_id, bio, caption="📱 **رمز الـ QR Code الخاص بك:**")
+        bot.send_photo(chat_id, bio, caption="📱 **رمز QR Code الخاص بك:**")
 
     user_states[chat_id] = None
 
-# ==================== [ تشغيل التطبيق والسيرفر المزدوج ] ====================
+# ==================== [ تشغيل التطبيق والسيرفر المزدوج المحصن ] ====================
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -1054,6 +952,20 @@ if __name__ == "__main__":
     # تشغيل سيرفر الويب في خلفية متوازية
     threading.Thread(target=run_flask, daemon=True).start()
     
-    print("✅ السيرفر يعمل الآن على المتصفح والبوت يستقبل الطلبات بكفاءة عالية!")
     bot.remove_webhook()
-    bot.infinity_polling(skip_pending=True)
+    print("✅ السيرفر يعمل الآن على المتصفح وبوت يستقبل الطلبات بكفاءة عالية!")
+
+    # حلقة حماية ذكية لتفادي أخطاء التضارب 409 أو توقف الحاوية على Render
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+        except ApiTelegramException as e:
+            if e.error_code == 409:
+                print("⚠️ تم اكتشاف تضارب (Conflict 409)، جارٍ إعادة الاتصال خلال 5 ثوانٍ...")
+                time.sleep(5)
+            else:
+                print(f"⚠️ خطأ تليجرام رقم {e.error_code}: {e}")
+                time.sleep(3)
+        except Exception as e:
+            print(f"⚠️ خطأ غير متوقع في الاتصال: {e}")
+            time.sleep(5)

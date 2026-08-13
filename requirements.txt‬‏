@@ -1,5 +1,6 @@
 pyTelegramBotAPI
 edge-tts
 gtts
+qrcode[pil]
 Flask
 gunicorn

@@ -3,7 +3,6 @@ import io
 import re
 import json
 import time
-import socket
 import random
 import string
 import urllib.parse
@@ -11,1065 +10,2082 @@ import hashlib
 import base64
 import datetime
 import sqlite3
-import requests
-import threading
 import zipfile
+import threading
+from pathlib import PurePosixPath
+
+import requests
 from flask import Flask, render_template_string, request, jsonify
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from gtts import gTTS
 import qrcode
 
-# ==================== [ إعدادات الحقوق والمفاتيح ] ====================
+# ============================================================
+# NEXORA | Telegram + Flask + GitHub Pages + Gemini
+# Render-friendly version: Telegram WEBHOOK (no infinity_polling)
+# ============================================================
 
 DEVELOPER_NAME = "المطور الجبوري"
-DEVELOPER_RIGHTS = "\n\n👑 **تطوير:** المطور الجبوري"
+DEVELOPER_RIGHTS = "\n\n👑 تطوير: المطور الجبوري"
 
-# مفاتيح الربط
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8638334231:AAEZr_3sZ3jbQKg_Syq04CgOnXDWvbTWLdg")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6KeiWbeu1PlIgMdPEe8ecmVYnnIbbwQScl-0IRhWvCUpw")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "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")
-GITHUB_USER = os.environ.get("GITHUB_USER", "akoasad7-arch")
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "my-sites")
+# ------------------------------------------------------------
+# Secrets: PUT THESE IN RENDER ENVIRONMENT VARIABLES
+# ------------------------------------------------------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_USER = os.environ.get("GITHUB_USER", "akoasad7-arch").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "my-sites").strip()
+
+# Render automatically provides this for a web service.
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+PORT = int(os.environ.get("PORT", "10000"))
+
+# Secret path for Telegram webhook.
+# Set WEBHOOK_SECRET in Render to a long random string.
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+if not WEBHOOK_SECRET:
+    WEBHOOK_SECRET = hashlib.sha256(
+        (BOT_TOKEN or "nexora-webhook").encode("utf-8")
+    ).hexdigest()[:32]
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing. Add BOT_TOKEN in Render Environment.")
 
 app = Flask(__name__)
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-# الذاكرة المؤقتة للعمليات
 user_states = {}
 pending_codes = {}
 
-# ==================== [ إدارة قاعدة البيانات المركزية ] ====================
+# ============================================================
+# Database
+# ============================================================
 
 DB_NAME = "bot_database.db"
+DB_LOCK = threading.Lock()
+
+
+def db_connect():
+    conn = sqlite3.connect(DB_NAME, timeout=30)
+    return conn
+
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            first_name TEXT,
-            username TEXT,
-            joined_at TEXT,
-            req_count INTEGER DEFAULT 0
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS ai_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            role TEXT,
-            content TEXT,
-            created_at TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS activity_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            tool_name TEXT,
-            created_at TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS user_sites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            filename TEXT,
-            url TEXT,
-            sha TEXT,
-            created_at TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    with DB_LOCK:
+        conn = db_connect()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                first_name TEXT,
+                username TEXT,
+                joined_at TEXT,
+                req_count INTEGER DEFAULT 0
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ai_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                role TEXT,
+                content TEXT,
+                created_at TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                tool_name TEXT,
+                created_at TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_sites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                filename TEXT,
+                url TEXT,
+                sha TEXT,
+                created_at TEXT
+            )
+        """)
+
+        conn.commit()
+        conn.close()
+
 
 def register_user(user_id, first_name, username):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("INSERT OR IGNORE INTO users (user_id, first_name, username, joined_at) VALUES (?, ?, ?, ?)",
-                   (user_id, first_name, username or "لا يوجد", now))
-    cursor.execute("UPDATE users SET req_count = req_count + 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    with DB_LOCK:
+        conn = db_connect()
+        cursor = conn.cursor()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO users
+            (user_id, first_name, username, joined_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, first_name or "مستخدم", username or "لا يوجد", now),
+        )
+
+        cursor.execute(
+            "UPDATE users SET req_count = req_count + 1 WHERE user_id = ?",
+            (user_id,),
+        )
+
+        conn.commit()
+        conn.close()
+
 
 def log_activity(user_id, tool_name):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("INSERT INTO activity_log (user_id, tool_name, created_at) VALUES (?, ?, ?)",
-                   (user_id, tool_name, now))
-    conn.commit()
-    conn.close()
+    with DB_LOCK:
+        conn = db_connect()
+        cursor = conn.cursor()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        cursor.execute(
+            """
+            INSERT INTO activity_log (user_id, tool_name, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, tool_name, now),
+        )
+
+        conn.commit()
+        conn.close()
+
 
 def save_ai_message(user_id, role, content):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("INSERT INTO ai_history (user_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                   (user_id, role, content, now))
-    conn.commit()
-    conn.close()
+    with DB_LOCK:
+        conn = db_connect()
+        cursor = conn.cursor()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        cursor.execute(
+            """
+            INSERT INTO ai_history
+            (user_id, role, content, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, role, content, now),
+        )
+
+        conn.commit()
+        conn.close()
+
 
 def get_user_ai_history(user_id, limit=6):
-    conn = sqlite3.connect(DB_NAME)
+    conn = db_connect()
     cursor = conn.cursor()
-    cursor.execute("SELECT role, content FROM ai_history WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit))
+
+    cursor.execute(
+        """
+        SELECT role, content
+        FROM ai_history
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
+
     rows = cursor.fetchall()
     conn.close()
+
     return [{"role": r[0], "text": r[1]} for r in reversed(rows)]
 
+
 def clear_user_ai_history(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM ai_history WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    with DB_LOCK:
+        conn = db_connect()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "DELETE FROM ai_history WHERE user_id = ?",
+            (user_id,),
+        )
+
+        conn.commit()
+        conn.close()
+
 
 def add_user_site(user_id, filename, url, sha):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    cursor.execute("INSERT INTO user_sites (user_id, filename, url, sha, created_at) VALUES (?, ?, ?, ?, ?)",
-                   (user_id, filename, url, sha, now))
-    conn.commit()
-    conn.close()
+    with DB_LOCK:
+        conn = db_connect()
+        cursor = conn.cursor()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        cursor.execute(
+            """
+            INSERT INTO user_sites
+            (user_id, filename, url, sha, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, filename, url, sha or "", now),
+        )
+
+        conn.commit()
+        conn.close()
+
 
 def remove_user_site(user_id, filename):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM user_sites WHERE user_id = ? AND filename = ?", (user_id, filename))
-    conn.commit()
-    conn.close()
+    with DB_LOCK:
+        conn = db_connect()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            DELETE FROM user_sites
+            WHERE user_id = ? AND filename = ?
+            """,
+            (user_id, filename),
+        )
+
+        conn.commit()
+        conn.close()
+
 
 def get_user_sites(user_id):
-    conn = sqlite3.connect(DB_NAME)
+    conn = db_connect()
     cursor = conn.cursor()
-    cursor.execute("SELECT filename, url, sha, created_at FROM user_sites WHERE user_id = ? ORDER BY id DESC", (user_id,))
+
+    cursor.execute(
+        """
+        SELECT filename, url, sha, created_at
+        FROM user_sites
+        WHERE user_id = ?
+        ORDER BY id DESC
+        """,
+        (user_id,),
+    )
+
     rows = cursor.fetchall()
     conn.close()
-    return [{"filename": r[0], "url": r[1], "sha": r[2], "date": r[3]} for r in rows]
+
+    return [
+        {
+            "filename": r[0],
+            "url": r[1],
+            "sha": r[2],
+            "date": r[3],
+        }
+        for r in rows
+    ]
+
 
 def get_global_stats():
-    conn = sqlite3.connect(DB_NAME)
+    conn = db_connect()
     cursor = conn.cursor()
+
     cursor.execute("SELECT COUNT(*) FROM users")
-    u_cnt = cursor.fetchone()[0]
+    users_count = cursor.fetchone()[0]
+
     cursor.execute("SELECT COUNT(*) FROM user_sites")
-    s_cnt = cursor.fetchone()[0]
+    sites_count = cursor.fetchone()[0]
+
     cursor.execute("SELECT COUNT(*) FROM ai_history")
-    ai_cnt = cursor.fetchone()[0]
+    ai_count = cursor.fetchone()[0]
+
     conn.close()
-    return u_cnt, s_cnt, ai_cnt
+    return users_count, sites_count, ai_count
+
 
 init_db()
 
-# ==================== [ محرك GitHub لنشر المواقع العلنية ] ====================
+# ============================================================
+# GitHub publishing
+# ============================================================
 
 def generate_random_name(length=6):
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+    return "".join(
+        random.choices(string.ascii_lowercase + string.digits, k=length)
+    )
+
 
 def sanitize_filename(name):
-    name = re.sub(r'[^a-zA-Z0-9_-]', '', name.strip().replace(' ', '-'))
+    name = str(name or "").strip()
+    name = name.replace(" ", "-")
+    name = re.sub(r"[^a-zA-Z0-9_-]", "", name)
     return name if name else f"site_{generate_random_name()}"
 
-def check_relative_assets(html_code):
-    pattern = r'(?:src|href)=["\'](?!http|https|data:)([^"\']+)["\']'
-    matches = re.findall(pattern, html_code, re.IGNORECASE)
-    media_files = [m for m in matches if any(m.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.mp4', '.webm', '.mp3', '.css', '.js'])]
-    return list(set(media_files))
+
+def github_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
 
 def publish_file_to_github(filename, content_bytes):
     if not GITHUB_TOKEN or len(GITHUB_TOKEN) < 10:
-        return None, None, "رمز GITHUB_TOKEN غير مضبوط بشكل صحيح."
+        return None, None, "GITHUB_TOKEN غير مضبوط في Render."
 
-    url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{filename}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
+    filename = filename.lstrip("/")
+    api_url = (
+        f"https://api.github.com/repos/"
+        f"{GITHUB_USER}/{GITHUB_REPO}/contents/{filename}"
+    )
+
     try:
-        encoded_content = base64.b64encode(content_bytes).decode('utf-8')
-        get_res = requests.get(url, headers=headers)
-        sha = get_res.json().get('sha') if get_res.status_code == 200 else None
+        headers = github_headers()
+
+        get_res = requests.get(
+            api_url,
+            headers=headers,
+            timeout=20,
+        )
+
+        sha = None
+        if get_res.status_code == 200:
+            sha = get_res.json().get("sha")
+
+        encoded_content = base64.b64encode(content_bytes).decode("utf-8")
 
         data = {
-            "message": f"Publish {filename} via Multi-Engine Bot",
-            "content": encoded_content
+            "message": f"Publish {filename} via NEXORA",
+            "content": encoded_content,
         }
+
         if sha:
             data["sha"] = sha
 
-        response = requests.put(url, json=data, headers=headers)
-        if response.status_code in [200, 201]:
-            new_sha = response.json().get("content", {}).get("sha", "")
-            live_url = f"https://{GITHUB_USER}.github.io/{GITHUB_REPO}/{filename}"
+        response = requests.put(
+            api_url,
+            json=data,
+            headers=headers,
+            timeout=30,
+        )
+
+        if response.status_code in (200, 201):
+            result = response.json()
+            new_sha = result.get("content", {}).get("sha", "")
+
+            live_url = (
+                f"https://{GITHUB_USER}.github.io/"
+                f"{GITHUB_REPO}/{filename}"
+            )
+
             return live_url, new_sha, None
-        else:
-            error_msg = response.json().get('message', 'خطأ في الاستجابة من GitHub')
-            return None, None, f"فشل النشر ({response.status_code}): {error_msg}"
+
+        try:
+            error_msg = response.json().get(
+                "message",
+                "خطأ من GitHub",
+            )
+        except Exception:
+            error_msg = response.text[:500]
+
+        return (
+            None,
+            None,
+            f"فشل النشر ({response.status_code}): {error_msg}",
+        )
+
     except Exception as e:
-        return None, None, f"خطأ الاتصال: {str(e)}"
+        return None, None, f"خطأ اتصال GitHub: {e}"
+
+
+def safe_zip_path(name):
+    """
+    Prevent ../ traversal when extracting ZIP entries.
+    Returns a normalized POSIX path or None.
+    """
+    name = name.replace("\\", "/").lstrip("/")
+    p = PurePosixPath(name)
+
+    if any(part in ("", ".", "..") for part in p.parts):
+        return None
+
+    return "/".join(p.parts)
+
 
 def delete_from_github(filename, sha=None):
-    url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{filename}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    if not sha:
-        get_res = requests.get(url, headers=headers)
-        if get_res.status_code == 200:
-            sha = get_res.json().get('sha')
-        else:
-            return False, "الملف غير موجود على GitHub."
+    if not GITHUB_TOKEN:
+        return False, "GITHUB_TOKEN غير مضبوط."
 
-    data = {
-        "message": f"Delete {filename}",
-        "sha": sha
-    }
-    res = requests.delete(url, json=data, headers=headers)
-    return (True, "تم الحذف بنجاح") if res.status_code == 200 else (False, f"فشل الحذف: {res.text}")
+    api_url = (
+        f"https://api.github.com/repos/"
+        f"{GITHUB_USER}/{GITHUB_REPO}/contents/{filename}"
+    )
 
-# ==================== [ محرك الذكاء الاصطناعي (Gemini 2.5 Flash) ] ====================
+    try:
+        headers = github_headers()
+
+        if not sha:
+            get_res = requests.get(
+                api_url,
+                headers=headers,
+                timeout=20,
+            )
+
+            if get_res.status_code != 200:
+                return False, "الملف غير موجود على GitHub."
+
+            sha = get_res.json().get("sha")
+
+        data = {
+            "message": f"Delete {filename} via NEXORA",
+            "sha": sha,
+        }
+
+        response = requests.delete(
+            api_url,
+            json=data,
+            headers=headers,
+            timeout=20,
+        )
+
+        if response.status_code == 200:
+            return True, "تم الحذف بنجاح"
+
+        return False, f"فشل الحذف: {response.text[:500]}"
+
+    except Exception as e:
+        return False, f"خطأ اتصال GitHub: {e}"
+
+
+# ============================================================
+# Gemini
+# ============================================================
 
 def process_ai_chat(user_id, prompt):
     history = get_user_ai_history(user_id, limit=6)
-    
+
     if GEMINI_API_KEY:
         try:
-            # استخدام الموديل المستقر المحدث Gemini 2.5 Flash
-            url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent"
+            url = (
+                "https://generativelanguage.googleapis.com/"
+                "v1beta/models/gemini-2.5-flash:generateContent"
+            )
+
             headers = {
                 "Content-Type": "application/json",
-                "x-goog-api-key": GEMINI_API_KEY
+                "x-goog-api-key": GEMINI_API_KEY,
             }
+
             contents = []
-            for h in history:
-                role_mapped = "model" if h["role"] in ["model", "assistant"] else "user"
-                contents.append({"role": role_mapped, "parts": [{"text": h["text"]}]})
-            contents.append({"role": "user", "parts": [{"text": prompt}]})
-            
-            payload = {"contents": contents}
-            res = requests.post(url, json=payload, headers=headers, timeout=15)
-            if res.status_code == 200:
-                data = res.json()
-                if 'candidates' in data and len(data['candidates']) > 0:
-                    ans = data['candidates'][0]['content']['parts'][0]['text']
-                    save_ai_message(user_id, "user", prompt)
-                    save_ai_message(user_id, "model", ans)
-                    return ans
+
+            for item in history:
+                role = (
+                    "model"
+                    if item["role"] in ("model", "assistant")
+                    else "user"
+                )
+
+                contents.append(
+                    {
+                        "role": role,
+                        "parts": [{"text": item["text"]}],
+                    }
+                )
+
+            contents.append(
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}],
+                }
+            )
+
+            payload = {
+                "contents": contents,
+                "generationConfig": {
+                    "temperature": 0.7,
+                },
+            }
+
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=30,
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+
+                candidates = data.get("candidates", [])
+
+                if candidates:
+                    parts = (
+                        candidates[0]
+                        .get("content", {})
+                        .get("parts", [])
+                    )
+
+                    if parts and parts[0].get("text"):
+                        answer = parts[0]["text"]
+
+                        save_ai_message(
+                            user_id,
+                            "user",
+                            prompt,
+                        )
+                        save_ai_message(
+                            user_id,
+                            "model",
+                            answer,
+                        )
+
+                        return answer
+
+            print(
+                "Gemini HTTP error:",
+                response.status_code,
+                response.text[:500],
+            )
+
         except Exception as e:
-            print(f"Gemini API Error: {e}")
+            print("Gemini API error:", e)
 
-    # السيرفر الاحتياطي
+    # Fallback
     try:
-        sys_context = "أنت مساعد ذكي ومحترف، تجيب باللغة العربية بأسلوب دقيق وشامل."
+        sys_context = (
+            "أنت مساعد ذكي ومحترف. "
+            "أجب باللغة العربية بوضوح ودقة."
+        )
+
         full_query = f"{sys_context}\nالمستخدم: {prompt}"
-        fallback_url = f"https://text.pollinations.ai/{urllib.parse.quote(full_query)}?model=openai"
-        res = requests.get(fallback_url, timeout=15)
-        if res.status_code == 200 and res.text.strip():
-            ans = res.text.strip()
+
+        fallback_url = (
+            "https://text.pollinations.ai/"
+            f"{urllib.parse.quote(full_query)}?model=openai"
+        )
+
+        response = requests.get(
+            fallback_url,
+            timeout=30,
+        )
+
+        if response.status_code == 200 and response.text.strip():
+            answer = response.text.strip()
+
             save_ai_message(user_id, "user", prompt)
-            save_ai_message(user_id, "model", ans)
-            return ans
+            save_ai_message(user_id, "model", answer)
+
+            return answer
+
     except Exception as e:
-        print(f"Fallback AI error: {e}")
+        print("Fallback AI error:", e)
 
-    return "❌ تعذر الاتصال بسيرفرات الذكاء الاصطناعي حالياً."
+    return "تعذر الاتصال بخدمات الذكاء الاصطناعي حاليًا."
 
-# ==================== [ أدوات مساعدة ورموز ] ====================
+
+# ============================================================
+# Tools
+# ============================================================
 
 MORSE_CODE_DICT = {
-    'A': '.-', 'B': '-...', 'C': '-.-.', 'D': '-..', 'E': '.', 'F': '..-.',
-    'G': '--.', 'H': '....', 'I': '..', 'J': '.---', 'K': '-.-', 'L': '.-..',
-    'M': '--', 'N': '-.', 'O': '---', 'P': '.--.', 'Q': '--.-', 'R': '.-.',
-    'S': '...', 'T': '-', 'U': '..-', 'V': '...-', 'W': '.--', 'X': '-..-',
-    'Y': '-.--', 'Z': '--..', '1': '.----', '2': '..---', '3': '...--',
-    '4': '....-', '5': '.....', '6': '-....', '7': '--...', '8': '---..',
-    '9': '----.', '0': '-----', ' ': '/'
+    "A": ".-", "B": "-...", "C": "-.-.", "D": "-..",
+    "E": ".", "F": "..-.", "G": "--.", "H": "....",
+    "I": "..", "J": ".---", "K": "-.-", "L": ".-..",
+    "M": "--", "N": "-.", "O": "---", "P": ".--.",
+    "Q": "--.-", "R": ".-.", "S": "...", "T": "-",
+    "U": "..-", "V": "...-", "W": ".--", "X": "-..-",
+    "Y": "-.--", "Z": "--..",
+    "1": ".----", "2": "..---", "3": "...--",
+    "4": "....-", "5": ".....", "6": "-....",
+    "7": "--...", "8": "---..", "9": "----.",
+    "0": "-----", " ": "/",
 }
 
-def to_morse(text):
-    return ' '.join(MORSE_CODE_DICT.get(char.upper(), char) for char in text)
 
-# ==================== [ واجهة المتصفح المتقدمة بدون إيموجيات (Chrome Web UI) ] ====================
+def to_morse(text):
+    return " ".join(
+        MORSE_CODE_DICT.get(char.upper(), char)
+        for char in text
+    )
+
+
+def generate_password(length=18):
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*_-"
+    return "".join(random.SystemRandom().choice(alphabet) for _ in range(length))
+
+
+# ============================================================
+# Web dashboard
+# ============================================================
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>لوحة التحكم الشاملة - المطور الجبوري</title>
-    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg-color: #0b0f19;
-            --card-bg: #151c2c;
-            --card-border: #232d42;
-            --accent-color: #6366f1;
-            --accent-hover: #4f46e5;
-            --text-main: #f3f4f6;
-            --text-muted: #9ca3af;
-            --success: #10b981;
-            --danger: #ef4444;
-        }
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            font-family: 'Tajawal', sans-serif;
-        }
-
-        body {
-            background-color: var(--bg-color);
-            color: var(--text-main);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-        }
-
-        /* Navbar */
-        .navbar {
-            background: var(--card-bg);
-            border-bottom: 1px solid var(--card-border);
-            padding: 1rem 2rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .brand {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            font-size: 1.25rem;
-            font-weight: 700;
-            color: var(--text-main);
-        }
-
-        .svg-icon {
-            width: 24px;
-            height: 24px;
-            fill: none;
-            stroke: var(--accent-color);
-            stroke-width: 2;
-            stroke-linecap: round;
-            stroke-linejoin: round;
-        }
-
-        .stats-badge {
-            background: rgba(99, 102, 241, 0.1);
-            color: var(--accent-color);
-            padding: 6px 14px;
-            border-radius: 20px;
-            font-size: 0.85rem;
-            border: 1px solid rgba(99, 102, 241, 0.3);
-        }
-
-        /* Container & Tabs */
-        .container {
-            max-width: 1200px;
-            margin: 2rem auto;
-            padding: 0 1rem;
-            width: 100%;
-            flex: 1;
-        }
-
-        .tabs {
-            display: flex;
-            gap: 10px;
-            border-bottom: 1px solid var(--card-border);
-            margin-bottom: 2rem;
-            overflow-x: auto;
-            padding-bottom: 5px;
-        }
-
-        .tab-btn {
-            background: transparent;
-            border: none;
-            color: var(--text-muted);
-            padding: 10px 20px;
-            font-size: 1rem;
-            font-weight: 600;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            border-radius: 8px;
-            transition: all 0.3s ease;
-            white-space: nowrap;
-        }
-
-        .tab-btn:hover, .tab-btn.active {
-            color: var(--text-main);
-            background: var(--card-bg);
-        }
-
-        .tab-btn.active {
-            border-bottom: 2px solid var(--accent-color);
-        }
-
-        /* Sections */
-        .tab-content {
-            display: none;
-        }
-
-        .tab-content.active {
-            display: block;
-        }
-
-        /* Cards Grid */
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 1.5rem;
-        }
-
-        .card {
-            background: var(--card-bg);
-            border: 1px solid var(--card-border);
-            border-radius: 12px;
-            padding: 1.5rem;
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-        }
-
-        .card-header {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            font-size: 1.1rem;
-            font-weight: 700;
-        }
-
-        /* Forms & Inputs */
-        textarea, input, select {
-            width: 100%;
-            background: var(--bg-color);
-            border: 1px solid var(--card-border);
-            border-radius: 8px;
-            padding: 12px;
-            color: var(--text-main);
-            font-size: 0.95rem;
-            outline: none;
-            transition: border-color 0.3s;
-        }
-
-        textarea:focus, input:focus {
-            border-color: var(--accent-color);
-        }
-
-        .btn {
-            background: var(--accent-color);
-            color: #fff;
-            border: none;
-            padding: 12px 20px;
-            border-radius: 8px;
-            font-size: 0.95rem;
-            font-weight: 600;
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            transition: background 0.3s;
-        }
-
-        .btn:hover {
-            background: var(--accent-hover);
-        }
-
-        .btn-danger {
-            background: var(--danger);
-        }
-
-        .btn-danger:hover {
-            background: #dc2626;
-        }
-
-        /* Response Box */
-        .response-box {
-            background: var(--bg-color);
-            border: 1px solid var(--card-border);
-            border-radius: 8px;
-            padding: 1rem;
-            min-height: 100px;
-            max-height: 400px;
-            overflow-y: auto;
-            font-size: 0.9rem;
-            white-space: pre-wrap;
-            word-break: break-word;
-        }
-
-        .url-box {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            background: rgba(16, 185, 129, 0.1);
-            border: 1px solid var(--success);
-            padding: 10px;
-            border-radius: 8px;
-            color: var(--success);
-            font-size: 0.9rem;
-            margin-top: 10px;
-        }
-
-        .url-box a {
-            color: var(--success);
-            text-decoration: underline;
-            word-break: break-all;
-        }
-
-        footer {
-            text-align: center;
-            padding: 1.5rem;
-            border-top: 1px solid var(--card-border);
-            color: var(--text-muted);
-            font-size: 0.85rem;
-            background: var(--card-bg);
-        }
-
-        @media (max-width: 768px) {
-            .navbar {
-                flex-direction: column;
-                gap: 10px;
-                text-align: center;
-            }
-            .tabs {
-                justify-content: flex-start;
-            }
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NEXORA | لوحة التحكم</title>
+<style>
+*{box-sizing:border-box}
+body{
+    margin:0;
+    font-family:Arial,Tahoma,sans-serif;
+    background:#0b0f19;
+    color:#f3f4f6;
+}
+.navbar{
+    padding:18px;
+    background:#151c2c;
+    border-bottom:1px solid #263047;
+    display:flex;
+    justify-content:space-between;
+    gap:15px;
+    flex-wrap:wrap;
+}
+.brand{font-size:22px;font-weight:bold}
+.stats{
+    color:#9ca3af;
+    padding:8px 12px;
+    border:1px solid #303a55;
+    border-radius:10px;
+}
+.container{max-width:1200px;margin:auto;padding:20px}
+.tabs{
+    display:flex;
+    gap:8px;
+    overflow:auto;
+    margin-bottom:20px;
+}
+.tab-btn{
+    border:1px solid #303a55;
+    background:#151c2c;
+    color:#ddd;
+    padding:12px 16px;
+    border-radius:10px;
+    cursor:pointer;
+    white-space:nowrap;
+}
+.tab-btn.active{background:#4f46e5}
+.tab-content{display:none}
+.tab-content.active{display:block}
+.grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+    gap:18px;
+}
+.card{
+    background:#151c2c;
+    border:1px solid #263047;
+    border-radius:14px;
+    padding:20px;
+}
+input,textarea{
+    width:100%;
+    margin:8px 0;
+    padding:13px;
+    background:#0b0f19;
+    border:1px solid #303a55;
+    border-radius:9px;
+    color:#fff;
+}
+button{
+    border:0;
+    border-radius:9px;
+    padding:12px 16px;
+    cursor:pointer;
+}
+.btn{
+    background:#6366f1;
+    color:white;
+    margin-top:8px;
+}
+.result{
+    margin-top:12px;
+    padding:14px;
+    background:#0b0f19;
+    border-radius:9px;
+    white-space:pre-wrap;
+    word-break:break-word;
+    min-height:60px;
+}
+a{color:#34d399}
+footer{
+    text-align:center;
+    padding:25px;
+    color:#9ca3af;
+}
+</style>
 </head>
+
 <body>
-
-    <nav class="navbar">
-        <div class="brand">
-            <svg class="svg-icon" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
-            <span>منصة التحكم والإستضافة السحابية</span>
-        </div>
-        <div class="stats-badge">
-            المستخدمين: {{ u_cnt }} | المواقع: {{ s_cnt }} | محادثات AI: {{ ai_cnt }}
-        </div>
-    </nav>
-
-    <div class="container">
-        <div class="tabs">
-            <button class="tab-btn active" onclick="switchTab('hosting')">
-                <svg class="svg-icon" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
-                نشر الأكواد والمواقع
-            </button>
-            <button class="tab-btn" onclick="switchTab('ai')">
-                <svg class="svg-icon" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z"/><circle cx="12" cy="12" r="3"/></svg>
-                الذكاء الاصطناعي (Gemini 2.5)
-            </button>
-            <button class="tab-btn" onclick="switchTab('cyber')">
-                <svg class="svg-icon" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-                الأمن السيبراني والشبكات
-            </button>
-            <button class="tab-btn" onclick="switchTab('tools')">
-                <svg class="svg-icon" viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
-                الأدوات العامة
-            </button>
-        </div>
-
-        <div id="hosting" class="tab-content active">
-            <div class="grid">
-                <div class="card">
-                    <div class="card-header">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-                        <span>تحويل كود HTML / CSS / JS إلى رابط مباشر</span>
-                    </div>
-                    <input type="text" id="custom_name" placeholder="اسم رابط الموقع (اختياري مثلاً: my-site)">
-                    <textarea id="web_code" rows="10" placeholder="الصق كود HTML هنا..."></textarea>
-                    <button class="btn" onclick="publishCode()">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-                        نشر الموقع على الإنترنت
-                    </button>
-                    <div id="publish_result"></div>
-                </div>
-
-                <div class="card">
-                    <div class="card-header">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                        <span>رفع مشروع كامل (ملف ZIP)</span>
-                    </div>
-                    <p style="font-size: 0.85rem; color: var(--text-muted);">قم بضغط ملفات موقعك (index.html, CSS, الصور) داخل ملف ZIP ورفعه مباشرة:</p>
-                    <input type="file" id="zip_file" accept=".zip">
-                    <button class="btn" onclick="publishZip()">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/></svg>
-                        رفع ونشر ZIP
-                    </button>
-                    <div id="zip_result"></div>
-                </div>
-            </div>
-        </div>
-
-        <div id="ai" class="tab-content">
-            <div class="card">
-                <div class="card-header">
-                    <svg class="svg-icon" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-                    <span>شاشة محادثة Gemini 2.5 Flash</span>
-                </div>
-                <div id="ai_chat_box" class="response-box" style="height: 300px;"></div>
-                <div style="display: flex; gap: 10px;">
-                    <input type="text" id="ai_prompt" placeholder="اكتب سؤالك للذكاء الاصطناعي..." onkeypress="if(event.key==='Enter') askAI()">
-                    <button class="btn" onclick="askAI()">إرسال</button>
-                </div>
-            </div>
-        </div>
-
-        <div id="cyber" class="tab-content">
-            <div class="grid">
-                <div class="card">
-                    <div class="card-header">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-                        <span>فحص الـ IP والـ DNS</span>
-                    </div>
-                    <input type="text" id="cyber_input" placeholder="أدخل IP أو اسم الدومين (مثلاً google.com)">
-                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                        <button class="btn" onclick="runCyberTool('ip')">فحص IP</button>
-                        <button class="btn" onclick="runCyberTool('dns')">سجلات DNS</button>
-                        <button class="btn" onclick="runCyberTool('ping')">قياس Ping</button>
-                    </div>
-                    <div id="cyber_result" class="response-box"></div>
-                </div>
-
-                <div class="card">
-                    <div class="card-header">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-                        <span>مولد التشفيرات وكلمات السر</span>
-                    </div>
-                    <input type="text" id="hash_input" placeholder="أدخل النص للتشفير">
-                    <div style="display: flex; gap: 10px;">
-                        <button class="btn" onclick="generateHash()">تشفير MD5 / SHA256</button>
-                        <button class="btn" onclick="generatePass()">توليد كلمة سر قوية</button>
-                    </div>
-                    <div id="hash_result" class="response-box"></div>
-                </div>
-            </div>
-        </div>
-
-        <div id="tools" class="tab-content">
-            <div class="grid">
-                <div class="card">
-                    <div class="card-header">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-                        <span>اختصار الروابط وتوليد باركود QR</span>
-                    </div>
-                    <input type="text" id="tool_url" placeholder="أدخل الرابط الطويل هنا...">
-                    <div style="display: flex; gap: 10px;">
-                        <button class="btn" onclick="shortenUrl()">اختصار الرابط</button>
-                        <button class="btn" onclick="makeQR()">توليد رمز QR</button>
-                    </div>
-                    <div id="tool_result" class="response-box"></div>
-                </div>
-            </div>
-        </div>
-
+<nav class="navbar">
+    <div class="brand">NEXORA | نكسورا</div>
+    <div class="stats">
+        المستخدمون: {{u_cnt}} |
+        المواقع: {{s_cnt}} |
+        محادثات AI: {{ai_cnt}}
     </div>
+</nav>
 
-    <footer>
-        تطوير وبرمجة المطور الجبوري &copy; جميع الحقوق محفوظة 2026
-    </footer>
+<div class="container">
 
-    <script>
-        function switchTab(tabId) {
-            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-            document.getElementById(tabId).classList.add('active');
-            event.currentTarget.classList.add('active');
-        }
+<div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('hosting',this)">
+        نشر المواقع
+    </button>
+    <button class="tab-btn" onclick="switchTab('ai',this)">
+        الذكاء الاصطناعي
+    </button>
+    <button class="tab-btn" onclick="switchTab('cyber',this)">
+        أدوات الشبكات
+    </button>
+    <button class="tab-btn" onclick="switchTab('tools',this)">
+        الأدوات العامة
+    </button>
+</div>
 
-        async function publishCode() {
-            const code = document.getElementById('web_code').value;
-            const name = document.getElementById('custom_name').value;
-            const resBox = document.getElementById('publish_result');
-            
-            if(!code) return alert('يرجى كتابة كود HTML أولاً');
-            resBox.innerHTML = 'جاري النشر وتوليد الرابط...';
+<section id="hosting" class="tab-content active">
+<div class="grid">
 
-            const resp = await fetch('/api/publish', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({code: code, custom_name: name})
-            });
-            const data = await resp.json();
+<div class="card">
+<h3>نشر HTML / CSS / JS</h3>
+<input id="custom_name" placeholder="اسم الموقع مثل my-site">
+<textarea id="web_code" rows="12"
+placeholder="ألصق كود HTML هنا"></textarea>
+<button class="btn" onclick="publishCode()">نشر الموقع</button>
+<div id="publish_result" class="result"></div>
+</div>
 
-            if(data.status === 'success') {
-                resBox.innerHTML = `<div class="url-box">تم نشر موقعك بنجاح:<br><a href="${data.url}" target="_blank">${data.url}</a></div>`;
-            } else {
-                resBox.innerHTML = `<div style="color:var(--danger)">حدث خطأ: ${data.message}</div>`;
-            }
-        }
+<div class="card">
+<h3>رفع ZIP</h3>
+<input type="file" id="zip_file" accept=".zip">
+<button class="btn" onclick="publishZip()">رفع ونشر ZIP</button>
+<div id="zip_result" class="result"></div>
+</div>
 
-        async function askAI() {
-            const promptInput = document.getElementById('ai_prompt');
-            const chatBox = document.getElementById('ai_chat_box');
-            const text = promptInput.value;
-            if(!text) return;
+</div>
+</section>
 
-            chatBox.innerHTML += `<div><b>أنت:</b> ${text}</div>`;
-            promptInput.value = '';
+<section id="ai" class="tab-content">
+<div class="card">
+<h3>Gemini 2.5 Flash</h3>
+<div id="ai_chat_box" class="result"
+style="height:300px;overflow:auto"></div>
+<input id="ai_prompt" placeholder="اكتب سؤالك">
+<button class="btn" onclick="askAI()">إرسال</button>
+</div>
+</section>
 
-            const resp = await fetch('/api/ai', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({prompt: text})
-            });
-            const data = await resp.json();
+<section id="cyber" class="tab-content">
+<div class="grid">
 
-            chatBox.innerHTML += `<div style="color:var(--accent-color); margin-top:5px;"><b>Gemini:</b> ${data.response}</div><hr style="border-color:var(--card-border); margin:10px 0;">`;
-            chatBox.scrollTop = chatBox.scrollHeight;
-        }
+<div class="card">
+<h3>فحص معلومات IP / DNS / Ping</h3>
+<input id="cyber_input"
+placeholder="IP أو domain مثل example.com">
+<button class="btn" onclick="runCyber('ip')">IP</button>
+<button class="btn" onclick="runCyber('dns')">DNS</button>
+<button class="btn" onclick="runCyber('ping')">Ping</button>
+<div id="cyber_result" class="result"></div>
+</div>
 
-        async function runCyberTool(type) {
-            const val = document.getElementById('cyber_input').value;
-            const resBox = document.getElementById('cyber_result');
-            if(!val) return alert('يرجى إدخال البيانات المطلوبة');
+<div class="card">
+<h3>Hash / Password</h3>
+<input id="hash_input" placeholder="النص">
+<button class="btn" onclick="makeHash()">MD5 / SHA256</button>
+<button class="btn" onclick="makePass()">كلمة مرور</button>
+<div id="hash_result" class="result"></div>
+</div>
 
-            resBox.innerText = 'جاري الفحص...';
-            const resp = await fetch(`/api/tools/cyber?type=${type}&target=${encodeURIComponent(val)}`);
-            const data = await resp.json();
-            resBox.innerText = data.result;
-        }
+</div>
+</section>
 
-        async function generateHash() {
-            const val = document.getElementById('hash_input').value;
-            const resBox = document.getElementById('hash_result');
-            const resp = await fetch(`/api/tools/hash?text=${encodeURIComponent(val)}`);
-            const data = await resp.json();
-            resBox.innerText = data.result;
-        }
+<section id="tools" class="tab-content">
+<div class="card">
+<h3>اختصار رابط / QR</h3>
+<input id="tool_url" placeholder="الرابط">
+<button class="btn" onclick="shorten()">اختصار</button>
+<button class="btn" onclick="qr()">QR</button>
+<div id="tool_result" class="result"></div>
+</div>
+</section>
 
-        async function generatePass() {
-            const resBox = document.getElementById('hash_result');
-            const resp = await fetch(`/api/tools/pass`);
-            const data = await resp.json();
-            resBox.innerText = 'كلمة السر المولدة: ' + data.result;
-        }
+</div>
 
-        async function shortenUrl() {
-            const url = document.getElementById('tool_url').value;
-            const resBox = document.getElementById('tool_result');
-            const resp = await fetch(`/api/tools/shorten?url=${encodeURIComponent(url)}`);
-            const data = await resp.json();
-            resBox.innerText = 'الرابط المختصر: ' + data.result;
-        }
+<footer>NEXORA — {{developer}}</footer>
 
-        async function makeQR() {
-            const url = document.getElementById('tool_url').value;
-            const resBox = document.getElementById('tool_result');
-            resBox.innerHTML = `<img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(url)}" />`;
-        }
-    </script>
+<script>
+function switchTab(id,btn){
+    document.querySelectorAll('.tab-content')
+        .forEach(x=>x.classList.remove('active'));
+    document.querySelectorAll('.tab-btn')
+        .forEach(x=>x.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+    btn.classList.add('active');
+}
+
+async function publishCode(){
+    const code=document.getElementById('web_code').value;
+    const name=document.getElementById('custom_name').value;
+    const box=document.getElementById('publish_result');
+
+    if(!code.trim()){
+        box.textContent='اكتب الكود أولاً';
+        return;
+    }
+
+    box.textContent='جاري النشر...';
+
+    const r=await fetch('/api/publish',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({code,custom_name:name})
+    });
+
+    const d=await r.json();
+
+    box.innerHTML=d.status==='success'
+        ? 'تم النشر:<br><a target="_blank" href="'+d.url+'">'+d.url+'</a>'
+        : d.message;
+}
+
+async function publishZip(){
+    const file=document.getElementById('zip_file').files[0];
+    const box=document.getElementById('zip_result');
+
+    if(!file){
+        box.textContent='اختر ZIP أولاً';
+        return;
+    }
+
+    const form=new FormData();
+    form.append('file',file);
+
+    box.textContent='جاري الرفع...';
+
+    const r=await fetch('/api/publish_zip',{
+        method:'POST',
+        body:form
+    });
+
+    const d=await r.json();
+
+    box.innerHTML=d.status==='success'
+        ? 'تم النشر:<br><a target="_blank" href="'+d.url+'">'+d.url+'</a>'
+        : d.message;
+}
+
+async function askAI(){
+    const input=document.getElementById('ai_prompt');
+    const box=document.getElementById('ai_chat_box');
+    const prompt=input.value.trim();
+
+    if(!prompt)return;
+
+    box.innerHTML+='<div><b>أنت:</b> '+escapeHtml(prompt)+'</div>';
+    input.value='';
+
+    const r=await fetch('/api/ai',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({prompt})
+    });
+
+    const d=await r.json();
+
+    box.innerHTML+='<div><b>NEXORA:</b> '
+        +escapeHtml(d.response||'')
+        +'</div><hr>';
+
+    box.scrollTop=box.scrollHeight;
+}
+
+async function runCyber(type){
+    const target=document.getElementById('cyber_input').value;
+    const box=document.getElementById('cyber_result');
+
+    if(!target)return;
+
+    box.textContent='جاري الفحص...';
+
+    const r=await fetch(
+        '/api/tools/cyber?type='+encodeURIComponent(type)
+        +'&target='+encodeURIComponent(target)
+    );
+
+    const d=await r.json();
+    box.textContent=d.result||'حدث خطأ';
+}
+
+async function makeHash(){
+    const text=document.getElementById('hash_input').value;
+    const r=await fetch(
+        '/api/tools/hash?text='+encodeURIComponent(text)
+    );
+    const d=await r.json();
+    document.getElementById('hash_result').textContent=d.result;
+}
+
+async function makePass(){
+    const r=await fetch('/api/tools/pass');
+    const d=await r.json();
+    document.getElementById('hash_result').textContent=d.result;
+}
+
+async function shorten(){
+    const url=document.getElementById('tool_url').value;
+    const r=await fetch(
+        '/api/tools/shorten?url='+encodeURIComponent(url)
+    );
+    const d=await r.json();
+    document.getElementById('tool_result').textContent=d.result;
+}
+
+function qr(){
+    const url=document.getElementById('tool_url').value;
+    if(!url)return;
+
+    document.getElementById('tool_result').innerHTML=
+        '<img width="180" height="180" src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&data='
+        +encodeURIComponent(url)+'">';
+}
+
+function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g,function(m){
+        return ({
+            '&':'&amp;',
+            '<':'&lt;',
+            '>':'&gt;',
+            '"':'&quot;',
+            "'":'&#039;'
+        })[m];
+    });
+}
+</script>
+
 </body>
 </html>
 """
 
-@app.route('/')
+
+@app.route("/")
 def web_dashboard():
     u_cnt, s_cnt, ai_cnt = get_global_stats()
-    return render_template_string(HTML_TEMPLATE, u_cnt=u_cnt, s_cnt=s_cnt, ai_cnt=ai_cnt)
 
-@app.route('/api/publish', methods=['POST'])
+    return render_template_string(
+        HTML_TEMPLATE,
+        u_cnt=u_cnt,
+        s_cnt=s_cnt,
+        ai_cnt=ai_cnt,
+        developer=DEVELOPER_NAME,
+    )
+
+
+@app.route("/health")
+def health():
+    return jsonify(
+        {
+            "status": "ok",
+            "service": "NEXORA",
+            "telegram": "webhook",
+        }
+    )
+
+
+@app.route("/api/publish", methods=["POST"])
 def api_publish():
-    data = request.json or {}
-    code = data.get('code', '')
-    custom_name = data.get('custom_name', '')
-    
+    data = request.get_json(silent=True) or {}
+
+    code = data.get("code", "")
+    custom_name = data.get("custom_name", "")
+
     if not code.strip():
-        return jsonify({"status": "error", "message": "الكود فارغ"})
+        return jsonify(
+            {
+                "status": "error",
+                "message": "الكود فارغ",
+            }
+        )
 
     filename = f"{sanitize_filename(custom_name)}.html"
-    live_url, sha, err = publish_file_to_github(filename, code.encode('utf-8'))
-    
+
+    live_url, sha, err = publish_file_to_github(
+        filename,
+        code.encode("utf-8"),
+    )
+
     if live_url:
-        add_user_site(1000, filename, live_url, sha) # 1000 للمستخدمين عبر الويب
-        return jsonify({"status": "success", "url": live_url})
-    return jsonify({"status": "error", "message": err})
+        # Website dashboard has no Telegram user, so use 0.
+        add_user_site(0, filename, live_url, sha)
 
-@app.route('/api/ai', methods=['POST'])
+        return jsonify(
+            {
+                "status": "success",
+                "url": live_url,
+            }
+        )
+
+    return jsonify(
+        {
+            "status": "error",
+            "message": err or "فشل النشر",
+        }
+    )
+
+
+@app.route("/api/publish_zip", methods=["POST"])
+def api_publish_zip():
+    uploaded = request.files.get("file")
+
+    if not uploaded:
+        return jsonify(
+            {
+                "status": "error",
+                "message": "لم يتم رفع ملف ZIP.",
+            }
+        )
+
+    if not uploaded.filename.lower().endswith(".zip"):
+        return jsonify(
+            {
+                "status": "error",
+                "message": "الملف يجب أن يكون ZIP.",
+            }
+        )
+
+    try:
+        data = uploaded.read()
+
+        if len(data) > 25 * 1024 * 1024:
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": "حجم ZIP كبير جدًا.",
+                }
+            )
+
+        folder = f"site_{generate_random_name()}"
+
+        with zipfile.ZipFile(io.BytesIO(data), "r") as z:
+            names = z.namelist()
+
+            index_url = None
+
+            for original_name in names:
+                if original_name.endswith("/"):
+                    continue
+
+                safe_name = safe_zip_path(original_name)
+
+                if not safe_name:
+                    continue
+
+                content = z.read(original_name)
+
+                target = f"{folder}/{safe_name}"
+
+                url, sha, err = publish_file_to_github(
+                    target,
+                    content,
+                )
+
+                if err:
+                    return jsonify(
+                        {
+                            "status": "error",
+                            "message": err,
+                        }
+                    )
+
+                if safe_name.lower() == "index.html":
+                    index_url = url
+
+        if not index_url:
+            index_url = (
+                f"https://{GITHUB_USER}.github.io/"
+                f"{GITHUB_REPO}/{folder}/index.html"
+            )
+
+        add_user_site(0, folder, index_url, "")
+
+        return jsonify(
+            {
+                "status": "success",
+                "url": index_url,
+            }
+        )
+
+    except zipfile.BadZipFile:
+        return jsonify(
+            {
+                "status": "error",
+                "message": "ملف ZIP غير صالح.",
+            }
+        )
+
+    except Exception as e:
+        return jsonify(
+            {
+                "status": "error",
+                "message": f"فشل ZIP: {e}",
+            }
+        )
+
+
+@app.route("/api/ai", methods=["POST"])
 def api_ai():
-    data = request.json or {}
-    prompt = data.get('prompt', '')
-    ans = process_ai_chat(1000, prompt)
-    return jsonify({"response": ans})
+    data = request.get_json(silent=True) or {}
 
-@app.route('/api/tools/cyber')
+    prompt = str(data.get("prompt", "")).strip()
+
+    if not prompt:
+        return jsonify(
+            {
+                "response": "اكتب سؤالًا أولاً."
+            }
+        )
+
+    answer = process_ai_chat(0, prompt)
+
+    return jsonify({"response": answer})
+
+
+@app.route("/api/tools/cyber")
 def api_cyber():
-    tool_type = request.args.get('type')
-    target = request.args.get('target', '').replace('http://', '').replace('https://', '').split('/')[0]
-    
-    if tool_type == 'ip':
-        res = requests.get(f"http://ip-api.com/json/{target}").json()
-        if res.get('status') == 'success':
-            out = f"IP: {target}\nالدولة: {res.get('country')}\nالمدينة: {res.get('city')}\nالمزود: {res.get('isp')}"
+    tool_type = request.args.get("type", "").strip()
+    target = request.args.get("target", "").strip()
+
+    target = (
+        target
+        .replace("http://", "")
+        .replace("https://", "")
+        .split("/")[0]
+    )
+
+    if not target:
+        return jsonify({"result": "أدخل IP أو domain."})
+
+    try:
+        if tool_type == "ip":
+            response = requests.get(
+                f"https://ip-api.com/json/{urllib.parse.quote(target)}",
+                timeout=10,
+            )
+
+            data = response.json()
+
+            if data.get("status") == "success":
+                result = (
+                    f"IP: {target}\n"
+                    f"الدولة: {data.get('country')}\n"
+                    f"المدينة: {data.get('city')}\n"
+                    f"المزود: {data.get('isp')}"
+                )
+            else:
+                result = "تعذر الحصول على معلومات IP."
+
+        elif tool_type == "dns":
+            response = requests.get(
+                "https://api.hackertarget.com/"
+                f"dnslookup/?q={urllib.parse.quote(target)}",
+                timeout=15,
+            )
+
+            result = response.text[:8000]
+
+        elif tool_type == "ping":
+            response = requests.get(
+                "https://api.hackertarget.com/"
+                f"nping/?q={urllib.parse.quote(target)}",
+                timeout=15,
+            )
+
+            result = response.text[:8000]
+
         else:
-            out = "تعذر الحصول على معلومات الـ IP."
-    elif tool_type == 'dns':
-        out = requests.get(f"https://api.hackertarget.com/dnslookup/?q={target}").text
-    elif tool_type == 'ping':
-        out = requests.get(f"https://api.hackertarget.com/nping/?q={target}").text
-    else:
-        out = "أداة غير معروفة."
-    return jsonify({"result": out})
+            result = "أداة غير معروفة."
 
-@app.route('/api/tools/hash')
+    except Exception as e:
+        result = f"فشل الفحص: {e}"
+
+    return jsonify({"result": result})
+
+
+@app.route("/api/tools/hash")
 def api_hash():
-    text = request.args.get('text', '')
-    md5 = hashlib.md5(text.encode()).hexdigest()
-    sha256 = hashlib.sha256(text.encode()).hexdigest()
-    return jsonify({"result": f"MD5:\n{md5}\n\nSHA256:\n{sha256}"})
+    text = request.args.get("text", "")
 
-@app.route('/api/tools/pass')
+    md5 = hashlib.md5(
+        text.encode("utf-8")
+    ).hexdigest()
+
+    sha256 = hashlib.sha256(
+        text.encode("utf-8")
+    ).hexdigest()
+
+    return jsonify(
+        {
+            "result":
+                f"MD5:\n{md5}\n\n"
+                f"SHA256:\n{sha256}"
+        }
+    )
+
+
+@app.route("/api/tools/pass")
 def api_pass():
-    pwd = ''.join(random.choices(string.ascii_letters + string.digits + "!@#$%^&*", k=16))
-    return jsonify({"result": pwd})
+    return jsonify(
+        {
+            "result": generate_password(18)
+        }
+    )
 
-@app.route('/api/tools/shorten')
+
+@app.route("/api/tools/shorten")
 def api_shorten():
-    url = request.args.get('url', '')
-    res = requests.get(f"https://is.gd/create.php?format=json&url={urllib.parse.quote(url)}").json()
-    return jsonify({"result": res.get('shorturl', 'فشل الاختصار')})
+    url = request.args.get("url", "").strip()
 
-# ==================== [ معالجة بوت التليجرام والمناطق التفاعلية ] ====================
+    if not url:
+        return jsonify(
+            {
+                "result": "أدخل رابطًا أولاً."
+            }
+        )
+
+    try:
+        response = requests.get(
+            "https://is.gd/create.php",
+            params={
+                "format": "json",
+                "url": url,
+            },
+            timeout=15,
+        )
+
+        data = response.json()
+
+        return jsonify(
+            {
+                "result": data.get(
+                    "shorturl",
+                    "فشل الاختصار",
+                )
+            }
+        )
+
+    except Exception as e:
+        return jsonify(
+            {
+                "result": f"فشل الاختصار: {e}"
+            }
+        )
+
+
+# ============================================================
+# Telegram UI
+# ============================================================
 
 def main_menu():
     markup = InlineKeyboardMarkup(row_width=2)
+
     markup.add(
-        InlineKeyboardButton("🤖 الذكاء الاصطناعي (12)", callback_data="menu_ai"),
-        InlineKeyboardButton("🛡️ الأمن السيبراني (15)", callback_data="menu_cyber"),
-        InlineKeyboardButton("📥 الوسائط والصوتيات (10)", callback_data="menu_media"),
-        InlineKeyboardButton("🎨 الزخرفة والنصوص (12)", callback_data="menu_decor"),
-        InlineKeyboardButton("🛠️ الأدوات العامة (15)", callback_data="menu_tools"),
-        InlineKeyboardButton("🌐 مواقعك المنشورة (/myfiles)", callback_data="menu_myfiles"),
-        InlineKeyboardButton("👤 حسابي وسجلي الخاص", callback_data="menu_profile")
+        InlineKeyboardButton(
+            "🤖 الذكاء الاصطناعي",
+            callback_data="menu_ai",
+        ),
+        InlineKeyboardButton(
+            "🛡️ الأمن السيبراني",
+            callback_data="menu_cyber",
+        ),
+        InlineKeyboardButton(
+            "📥 الوسائط والصوتيات",
+            callback_data="menu_media",
+        ),
+        InlineKeyboardButton(
+            "🎨 الزخرفة والنصوص",
+            callback_data="menu_decor",
+        ),
+        InlineKeyboardButton(
+            "🛠️ الأدوات العامة",
+            callback_data="menu_tools",
+        ),
+        InlineKeyboardButton(
+            "🌐 مواقعي المنشورة",
+            callback_data="menu_myfiles",
+        ),
+        InlineKeyboardButton(
+            "👤 حسابي",
+            callback_data="menu_profile",
+        ),
     )
+
     return markup
 
-@bot.message_handler(commands=['start', 'help'])
+
+@bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
-    u_id = message.chat.id
-    register_user(u_id, message.from_user.first_name, message.from_user.username)
-    user_states[u_id] = None
-    
+    user_id = message.chat.id
+
+    register_user(
+        user_id,
+        message.from_user.first_name,
+        message.from_user.username,
+    )
+
+    user_states[user_id] = None
+
+    first_name = message.from_user.first_name or "صديقي"
+
     welcome_text = (
-        f"🔥 **أهلاً بك يا {message.from_user.first_name} في البوت المطور المدمج!**\n\n"
-        "✨ **أبرز الخدمات المتاحة:**\n"
-        "• 🌐 **تحويل كود HTML / CSS / ZIP لرابط علني مباشر** (فقط أرسل الملف أو الكود هنا).\n"
-        "• 🤖 **الذكاء الاصطناعي (Gemini 2.5 Flash)** للاستفسارات والبرمجة.\n"
-        "• 🛡️ **أدوات الأمن السيبراني وفحص الشبكات**.\n"
-        "• 🛠️ **أدوات النصوص والتشفير والوسائط**.\n"
+        f"مرحبًا {first_name} في NEXORA | نكسورا\n\n"
+        "منصة تقنية تجمع الذكاء الاصطناعي، "
+        "أدوات الشبكات، ونشر المواقع.\n\n"
+        "الخدمات:\n"
+        "• نشر HTML / CSS / JS\n"
+        "• نشر مشاريع ZIP\n"
+        "• Gemini 2.5 Flash\n"
+        "• أدوات معلومات الشبكات\n"
+        "• Hash وكلمات مرور\n"
+        "• QR واختصار الروابط\n"
         f"{DEVELOPER_RIGHTS}"
     )
-    bot.send_message(u_id, welcome_text, reply_markup=main_menu())
 
-@bot.message_handler(commands=['myfiles'])
+    bot.send_message(
+        user_id,
+        welcome_text,
+        reply_markup=main_menu(),
+    )
+
+
+@bot.message_handler(commands=["myfiles"])
 def show_my_files(message):
     chat_id = message.chat.id
+
     sites = get_user_sites(chat_id)
 
     if not sites:
-        bot.send_message(chat_id, "📂 لا توجد لديك أي مواقع منشورة حالياً.")
+        bot.send_message(
+            chat_id,
+            "لا توجد لديك مواقع منشورة حاليًا.",
+        )
         return
 
-    msg = "🌐 **قائمة مواقعك المنشورة:**\n\n"
+    text = "قائمة مواقعك المنشورة:\n\n"
     markup = InlineKeyboardMarkup()
 
-    for idx, site in enumerate(sites, 1):
-        msg += f"{idx}️⃣ **الملف:** `{site['filename']}`\n🔗 {site['url']}\n📅 {site.get('date', 'غير محدد')}\n\n"
-        markup.add(
-            InlineKeyboardButton(f"🗑️ حذف {site['filename']}", callback_data=f"del_{site['filename']}")
+    for index, site in enumerate(sites, 1):
+        text += (
+            f"{index}. {site['filename']}\n"
+            f"الرابط: {site['url']}\n"
+            f"التاريخ: {site['date']}\n\n"
         )
 
-    bot.send_message(chat_id, msg, reply_markup=markup)
+        markup.add(
+            InlineKeyboardButton(
+                f"حذف {site['filename']}",
+                callback_data=f"del:{site['filename']}",
+            )
+        )
 
-@bot.message_handler(content_types=['text', 'document'])
+    bot.send_message(
+        chat_id,
+        text,
+        reply_markup=markup,
+    )
+
+
+@bot.message_handler(content_types=["text", "document"])
 def handle_incoming_content(message):
     chat_id = message.chat.id
 
-    if user_states.get(chat_id) == "waiting_custom_name":
+    register_user(
+        chat_id,
+        message.from_user.first_name,
+        message.from_user.username,
+    )
+
+    state = user_states.get(chat_id)
+
+    if state == "waiting_custom_name":
+        if not message.text:
+            bot.send_message(
+                chat_id,
+                "أرسل اسم الموقع كنص.",
+            )
+            return
+
         custom_name = sanitize_filename(message.text)
+
         user_states[chat_id] = None
+
         if chat_id in pending_codes:
-            pending_codes[chat_id]['custom_name'] = f"{custom_name}.html"
-            execute_publishing_process(chat_id, pending_codes[chat_id]['message_id'])
+            pending_codes[chat_id]["custom_name"] = (
+                f"{custom_name}.html"
+            )
+
+            execute_publishing_process(
+                chat_id,
+                pending_codes[chat_id]["message_id"],
+            )
+
         return
 
-    # إذا كان المستخدم في وضع أداة تليجرام عادية
-    state = user_states.get(chat_id)
     if state and state.startswith("tool_"):
         process_telegram_tool(message, state)
         return
 
-    # معالجة رفع الملفات والأكواد للنشر
     code_content = ""
     is_zip = False
     file_bytes = None
 
-    if message.content_type == 'document':
-        file_name = message.document.file_name.lower()
-        file_info = bot.get_file(message.document.file_id)
-        file_bytes = bot.download_file(file_info.file_path)
+    try:
+        if message.content_type == "document":
+            file_name = (
+                message.document.file_name or ""
+            ).lower()
 
-        if file_name.endswith('.zip'):
-            is_zip = True
+            if message.document.file_size and message.document.file_size > 25 * 1024 * 1024:
+                bot.send_message(
+                    chat_id,
+                    "حجم الملف أكبر من 25MB.",
+                )
+                return
+
+            file_info = bot.get_file(
+                message.document.file_id
+            )
+
+            file_bytes = bot.download_file(
+                file_info.file_path
+            )
+
+            if file_name.endswith(".zip"):
+                is_zip = True
+            else:
+                code_content = file_bytes.decode(
+                    "utf-8",
+                    errors="ignore",
+                )
+
+        elif message.text and (
+            "<html" in message.text.lower()
+            or "<div" in message.text.lower()
+            or "<script" in message.text.lower()
+            or "<!doctype" in message.text.lower()
+        ):
+            code_content = message.text
+            file_bytes = code_content.encode("utf-8")
+
         else:
-            code_content = file_bytes.decode('utf-8', errors='ignore')
-    elif message.text and ("<html" in message.text.lower() or "<div" in message.text.lower() or "<script" in message.text.lower()):
-        code_content = message.text
-        file_bytes = code_content.encode('utf-8')
-    else:
-        # إذا نص عادي بدون اختيار أداة، قم بتوجيهه للذكاء الاصطناعي تلقائياً
-        ans = process_ai_chat(chat_id, message.text)
-        bot.reply_to(message, f"🤖 **Gemini 2.5:**\n\n{ans}{DEVELOPER_RIGHTS}")
+            prompt = message.text or ""
+
+            answer = process_ai_chat(
+                chat_id,
+                prompt,
+            )
+
+            bot.reply_to(
+                message,
+                f"🤖 NEXORA:\n\n{answer}"
+                f"{DEVELOPER_RIGHTS}",
+            )
+
+            return
+
+    except Exception as e:
+        bot.send_message(
+            chat_id,
+            f"حدث خطأ أثناء قراءة الملف: {e}",
+        )
         return
 
     pending_codes[chat_id] = {
-        'bytes': file_bytes,
-        'is_zip': is_zip,
-        'custom_name': None
+        "bytes": file_bytes,
+        "is_zip": is_zip,
+        "custom_name": None,
     }
 
     markup = InlineKeyboardMarkup()
+
     markup.row(
-        InlineKeyboardButton("🚀 نشر باسم عشوائي", callback_data="pub_random"),
-        InlineKeyboardButton("✏️ تخصيص اسم الرابط", callback_data="pub_custom")
+        InlineKeyboardButton(
+            "🚀 نشر باسم عشوائي",
+            callback_data="pub_random",
+        ),
+        InlineKeyboardButton(
+            "✏️ تخصيص الاسم",
+            callback_data="pub_custom",
+        ),
     )
 
-    msg = bot.send_message(
-        chat_id, 
-        "📥 **تم استلام كود/مشروع الويب!**\nاختر طريقة النشر المولدة على GitHub Pages:",
-        reply_markup=markup
+    sent = bot.send_message(
+        chat_id,
+        "تم استلام الكود/المشروع.\n"
+        "اختر طريقة النشر:",
+        reply_markup=markup,
     )
-    pending_codes[chat_id]['message_id'] = msg.message_id
+
+    pending_codes[chat_id]["message_id"] = (
+        sent.message_id
+    )
+
 
 def execute_publishing_process(chat_id, message_id):
     if chat_id not in pending_codes:
-        bot.send_message(chat_id, "⚠️ انتهت الجلسة، أرسل الكود مجدداً.")
+        bot.send_message(
+            chat_id,
+            "انتهت الجلسة، أرسل الملف مرة أخرى.",
+        )
         return
 
     data = pending_codes[chat_id]
-    filename = data['custom_name']
-    
-    bot.edit_message_text("⏳ **جاري النشر والرفع على السيرفر...**", chat_id, message_id)
 
-    if data['is_zip']:
-        folder_name = filename.replace('.html', '')
-        live_url, sha = None, None
-        try:
-            zip_buffer = io.BytesIO(data['bytes'])
-            with zipfile.ZipFile(zip_buffer, 'r') as zip_ref:
+    filename = data["custom_name"]
+
+    try:
+        bot.edit_message_text(
+            "جاري النشر على GitHub...",
+            chat_id,
+            message_id,
+        )
+    except Exception:
+        pass
+
+    live_url = None
+    sha = None
+    err = None
+
+    try:
+        if data["is_zip"]:
+            folder_name = (
+                filename
+                .replace(".html", "")
+            )
+
+            with zipfile.ZipFile(
+                io.BytesIO(data["bytes"]),
+                "r",
+            ) as zip_ref:
+
                 for file_in_zip in zip_ref.namelist():
-                    if not file_in_zip.endswith('/'):
-                        content = zip_ref.read(file_in_zip)
-                        target_path = f"{folder_name}/{file_in_zip}"
-                        url, file_sha, err = publish_file_to_github(target_path, content)
-                        if file_in_zip.lower() in ['index.html', 'main.html']:
-                            live_url, sha = url, file_sha
-            if not live_url:
-                live_url = f"https://{GITHUB_USER}.github.io/{GITHUB_REPO}/{folder_name}/index.html"
-        except Exception as e:
-            bot.send_message(chat_id, f"❌ فشل فك ضغط ZIP: {str(e)}")
-            return
-    else:
-        live_url, sha, err = publish_file_to_github(filename, data['bytes'])
+                    if file_in_zip.endswith("/"):
+                        continue
 
-    if live_url:
-        add_user_site(chat_id, filename, live_url, sha)
-        del pending_codes[chat_id]
+                    safe_name = safe_zip_path(
+                        file_in_zip
+                    )
+
+                    if not safe_name:
+                        continue
+
+                    content = zip_ref.read(
+                        file_in_zip
+                    )
+
+                    target_path = (
+                        f"{folder_name}/{safe_name}"
+                    )
+
+                    url, file_sha, file_err = (
+                        publish_file_to_github(
+                            target_path,
+                            content,
+                        )
+                    )
+
+                    if file_err:
+                        err = file_err
+                        break
+
+                    if safe_name.lower() == "index.html":
+                        live_url = url
+                        sha = file_sha
+
+            if not err and not live_url:
+                live_url = (
+                    f"https://{GITHUB_USER}.github.io/"
+                    f"{GITHUB_REPO}/{folder_name}/index.html"
+                )
+
+        else:
+            live_url, sha, err = (
+                publish_file_to_github(
+                    filename,
+                    data["bytes"],
+                )
+            )
+
+    except zipfile.BadZipFile:
+        err = "ملف ZIP غير صالح."
+
+    except Exception as e:
+        err = str(e)
+
+    if live_url and not err:
+        add_user_site(
+            chat_id,
+            filename,
+            live_url,
+            sha,
+        )
+
+        pending_codes.pop(chat_id, None)
+
         bot.send_message(
             chat_id,
-            f"🎉 **تم نشر موقعك بنجاح!**\n\n🔗 **الرابط العلني المباشر:**\n{live_url}"
+            "تم نشر موقعك بنجاح.\n\n"
+            f"الرابط:\n{live_url}",
         )
+
     else:
-        bot.send_message(chat_id, f"❌ فشل النشر: {err}")
+        bot.send_message(
+            chat_id,
+            f"فشل النشر:\n{err or 'خطأ غير معروف'}",
+        )
+
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     chat_id = call.message.chat.id
-    data = call.data
+    data = call.data or ""
 
-    if data.startswith("del_"):
-        filename = data.replace("del_", "")
-        bot.edit_message_text(f"⏳ جاري حذف الملف `{filename}`...", chat_id, call.message.message_id)
-        success, res_msg = delete_from_github(filename)
+    try:
+        bot.answer_callback_query(
+            call.id
+        )
+    except Exception:
+        pass
+
+    if data.startswith("del:"):
+        filename = data.split(":", 1)[1]
+
+        try:
+            bot.edit_message_text(
+                f"جاري حذف {filename}...",
+                chat_id,
+                call.message.message_id,
+            )
+        except Exception:
+            pass
+
+        success, message = delete_from_github(
+            filename
+        )
+
         if success:
-            remove_user_site(chat_id, filename)
-            bot.send_message(chat_id, f"✅ تم حذف الملف `{filename}` بنجاح.")
+            remove_user_site(
+                chat_id,
+                filename,
+            )
+
+            bot.send_message(
+                chat_id,
+                f"تم حذف {filename} بنجاح.",
+            )
         else:
-            bot.send_message(chat_id, f"❌ خطأ بالحذف: {res_msg}")
+            bot.send_message(
+                chat_id,
+                f"فشل الحذف:\n{message}",
+            )
+
         return
 
     if data == "pub_random":
-        pending_codes[chat_id]['custom_name'] = f"site_{generate_random_name()}.html"
-        execute_publishing_process(chat_id, call.message.message_id)
+        if chat_id not in pending_codes:
+            bot.send_message(
+                chat_id,
+                "انتهت الجلسة، أرسل الملف مرة أخرى.",
+            )
+            return
 
-    elif data == "pub_custom":
-        user_states[chat_id] = "waiting_custom_name"
-        bot.edit_message_text("✏️ أرسل اسم الرابط المطلوب (مثلاً: `my-portfolio`):", chat_id, call.message.message_id)
+        is_zip = pending_codes[chat_id]["is_zip"]
 
-    elif data == "menu_myfiles":
+        if is_zip:
+            pending_codes[chat_id]["custom_name"] = (
+                f"site_{generate_random_name()}.html"
+            )
+        else:
+            pending_codes[chat_id]["custom_name"] = (
+                f"site_{generate_random_name()}.html"
+            )
+
+        execute_publishing_process(
+            chat_id,
+            call.message.message_id,
+        )
+
+        return
+
+    if data == "pub_custom":
+        if chat_id not in pending_codes:
+            bot.send_message(
+                chat_id,
+                "انتهت الجلسة، أرسل الملف مرة أخرى.",
+            )
+            return
+
+        user_states[chat_id] = (
+            "waiting_custom_name"
+        )
+
+        try:
+            bot.edit_message_text(
+                "أرسل اسم الموقع الآن، مثل:\n"
+                "my-portfolio",
+                chat_id,
+                call.message.message_id,
+            )
+        except Exception:
+            pass
+
+        return
+
+    if data == "menu_myfiles":
         show_my_files(call.message)
+        return
+
+    if data == "menu_ai":
+        user_states[chat_id] = "tool_ai"
+
+        bot.send_message(
+            chat_id,
+            "أرسل سؤالك الآن وسأرسله إلى Gemini.",
+        )
+
+        return
+
+    if data == "menu_cyber":
+        user_states[chat_id] = "tool_ip_info"
+
+        bot.send_message(
+            chat_id,
+            "أرسل IP أو domain للحصول على معلومات عامة عنه.",
+        )
+
+        return
+
+    if data == "menu_tools":
+        markup = InlineKeyboardMarkup(row_width=2)
+
+        markup.add(
+            InlineKeyboardButton(
+                "🔐 توليد كلمة مرور",
+                callback_data="tool_password",
+            ),
+            InlineKeyboardButton(
+                "🔗 اختصار رابط",
+                callback_data="tool_short",
+            ),
+            InlineKeyboardButton(
+                "📱 QR",
+                callback_data="tool_qr",
+            ),
+            InlineKeyboardButton(
+                "🔢 Hash",
+                callback_data="tool_hash",
+            ),
+        )
+
+        bot.send_message(
+            chat_id,
+            "اختر أداة:",
+            reply_markup=markup,
+        )
+
+        return
+
+    if data == "menu_profile":
+        sites = get_user_sites(chat_id)
+
+        bot.send_message(
+            chat_id,
+            f"👤 حسابك\n\n"
+            f"ID: {chat_id}\n"
+            f"عدد المواقع المنشورة: {len(sites)}",
+        )
+
+        return
+
+    if data == "menu_media":
+        bot.send_message(
+            chat_id,
+            "قسم الوسائط جاهز للإضافة في هذه النسخة.",
+        )
+        return
+
+    if data == "menu_decor":
+        bot.send_message(
+            chat_id,
+            "أرسل النص الذي تريد زخرفته.",
+        )
+        user_states[chat_id] = "tool_decor"
+        return
+
+    if data == "tool_password":
+        bot.send_message(
+            chat_id,
+            f"كلمة المرور:\n`{generate_password()}`",
+        )
+        return
+
+    if data == "tool_qr":
+        user_states[chat_id] = "tool_make_qr"
+
+        bot.send_message(
+            chat_id,
+            "أرسل الرابط أو النص لإنشاء QR.",
+        )
+        return
+
+    if data == "tool_hash":
+        user_states[chat_id] = "tool_hash"
+
+        bot.send_message(
+            chat_id,
+            "أرسل النص لإنشاء MD5 وSHA256.",
+        )
+        return
+
+    if data == "tool_short":
+        user_states[chat_id] = "tool_short"
+
+        bot.send_message(
+            chat_id,
+            "أرسل الرابط الطويل.",
+        )
+        return
+
 
 def process_telegram_tool(message, state):
     chat_id = message.chat.id
-    text = message.text.strip()
-
-    if state == "tool_ip_info":
-        res = requests.get(f"http://ip-api.com/json/{text}").json()
-        if res.get('status') == 'success':
-            bot.send_message(chat_id, f"🌐 **بيانات ה-IP:**\nالدولة: {res.get('country')}\nالمدينة: {res.get('city')}\nالمزود: {res.get('isp')}")
-        else:
-            bot.send_message(chat_id, "❌ متعذر جلب بيانات هذا الـ IP.")
-
-    elif state == "tool_make_qr":
-        img = qrcode.make(text)
-        bio = io.BytesIO()
-        img.save(bio, 'PNG')
-        bio.seek(0)
-        bot.send_photo(chat_id, bio, caption="📱 **رمز الـ QR Code الخاص بك:**")
-
-    user_states[chat_id] = None
-
-# ==================== [ تشغيل التطبيق والسيرفر المزدوج ] ====================
-
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-if __name__ == "__main__":
-    print(f"🚀 تشغيل {DEVELOPER_NAME}...")
-
-    threading.Thread(
-        target=run_flask,
-        daemon=True
-    ).start()
-
-    print("🌐 Flask server started")
-    print("🤖 Removing Telegram webhook...")
+    text = (message.text or "").strip()
 
     try:
-        bot.remove_webhook()
-        time.sleep(2)
+        if state == "tool_ai":
+            answer = process_ai_chat(
+                chat_id,
+                text,
+            )
 
-        print("🤖 Starting Telegram polling...")
-        bot.infinity_polling(
-            skip_pending=True,
-            timeout=30,
-            long_polling_timeout=30
-        )
+            bot.send_message(
+                chat_id,
+                f"🤖 NEXORA:\n\n{answer}",
+            )
+
+        elif state == "tool_ip_info":
+            target = (
+                text
+                .replace("http://", "")
+                .replace("https://", "")
+                .split("/")[0]
+            )
+
+            response = requests.get(
+                f"https://ip-api.com/json/"
+                f"{urllib.parse.quote(target)}",
+                timeout=10,
+            )
+
+            data = response.json()
+
+            if data.get("status") == "success":
+                bot.send_message(
+                    chat_id,
+                    "بيانات عامة:\n"
+                    f"الدولة: {data.get('country')}\n"
+                    f"المدينة: {data.get('city')}\n"
+                    f"المزود: {data.get('isp')}\n"
+                    f"IP: {data.get('query')}",
+                )
+            else:
+                bot.send_message(
+                    chat_id,
+                    "تعذر الحصول على البيانات.",
+                )
+
+        elif state == "tool_make_qr":
+            image = qrcode.make(text)
+
+            buffer = io.BytesIO()
+            image.save(buffer, "PNG")
+            buffer.seek(0)
+            buffer.name = "qrcode.png"
+
+            bot.send_photo(
+                chat_id,
+                buffer,
+                caption="رمز QR الخاص بك.",
+            )
+
+        elif state == "tool_hash":
+            md5 = hashlib.md5(
+                text.encode("utf-8")
+            ).hexdigest()
+
+            sha = hashlib.sha256(
+                text.encode("utf-8")
+            ).hexdigest()
+
+            bot.send_message(
+                chat_id,
+                f"MD5:\n`{md5}`\n\n"
+                f"SHA256:\n`{sha}`",
+            )
+
+        elif state == "tool_short":
+            response = requests.get(
+                "https://is.gd/create.php",
+                params={
+                    "format": "json",
+                    "url": text,
+                },
+                timeout=15,
+            )
+
+            data = response.json()
+
+            bot.send_message(
+                chat_id,
+                data.get(
+                    "shorturl",
+                    "فشل اختصار الرابط.",
+                ),
+            )
+
+        elif state == "tool_decor":
+            decorated = (
+                f"『 {text} 』\n"
+                f"★ {text} ★\n"
+                f"「 {text} 」"
+            )
+
+            bot.send_message(
+                chat_id,
+                decorated,
+            )
 
     except Exception as e:
-        print(f"❌ Telegram error: {e}")
-        raise
+        bot.send_message(
+            chat_id,
+            f"حدث خطأ:\n{e}",
+        )
+
+    finally:
+        user_states[chat_id] = None
+
+
+# ============================================================
+# Telegram WEBHOOK
+# ============================================================
+
+WEBHOOK_PATH = f"/telegram/{WEBHOOK_SECRET}"
+
+
+@app.route(
+    WEBHOOK_PATH,
+    methods=["POST"],
+)
+def telegram_webhook():
+    try:
+        raw = request.get_data(
+            cache=False,
+            as_text=True,
+        )
+
+        if not raw:
+            return "empty", 400
+
+        update = telebot.types.Update.de_json(
+            raw
+        )
+
+        if update:
+            bot.process_new_updates(
+                [update]
+            )
+
+        return "OK", 200
+
+    except Exception as e:
+        print("Telegram webhook error:", e)
+        return "error", 500
+
+
+def setup_telegram_webhook():
+    if not RENDER_EXTERNAL_URL:
+        print(
+            "WARNING: RENDER_EXTERNAL_URL is missing."
+        )
+        print(
+            "Add it manually in Render, e.g. "
+            "https://your-service.onrender.com"
+        )
+        return False
+
+    webhook_url = (
+        f"{RENDER_EXTERNAL_URL}"
+        f"{WEBHOOK_PATH}"
+    )
+
+    try:
+        # This replaces any previous webhook for THIS token.
+        bot.set_webhook(
+            url=webhook_url,
+            drop_pending_updates=True,
+        )
+
+        info = bot.get_webhook_info()
+
+        print("========================================")
+        print("Telegram webhook configured.")
+        print("Webhook URL:", webhook_url)
+        print("Pending updates:", info.pending_update_count)
+        print("========================================")
+
+        return True
+
+    except Exception as e:
+        print(
+            "Telegram webhook setup failed:",
+            e,
+        )
+        return False
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def run_flask():
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False,
+        use_reloader=False,
+        threaded=True,
+    )
+
+
+if __name__ == "__main__":
+    print("========================================")
+    print("NEXORA starting...")
+    print("Developer:", DEVELOPER_NAME)
+    print("Port:", PORT)
+    print("Mode: Telegram WEBHOOK")
+    print("========================================")
+
+    flask_thread = threading.Thread(
+        target=run_flask,
+        daemon=True,
+    )
+
+    flask_thread.start()
+
+    # Give Flask a moment to bind the port.
+    time.sleep(2)
+
+    setup_telegram_webhook()
+
+    print("NEXORA is running.")
+    print("Telegram polling is NOT used.")
+    print("Keep this process alive for Render.")
+
+    # Keep the main process alive.
+    while True:
+        time.sleep(60)

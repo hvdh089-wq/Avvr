@@ -1049,11 +1049,27 @@ def run_flask():
     app.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
-    print(f"🚀 جاري تشغيل سيرفر المتصفح وبوت التليجرام برعاية {DEVELOPER_NAME}...")
-    
-    # تشغيل سيرفر الويب في خلفية متوازية
-    threading.Thread(target=run_flask, daemon=True).start()
-    
-    print("✅ السيرفر يعمل الآن على المتصفح والبوت يستقبل الطلبات بكفاءة عالية!")
-    bot.remove_webhook()
-    bot.infinity_polling(skip_pending=True)
+    print(f"🚀 تشغيل {DEVELOPER_NAME}...")
+
+    threading.Thread(
+        target=run_flask,
+        daemon=True
+    ).start()
+
+    print("🌐 Flask server started")
+    print("🤖 Removing Telegram webhook...")
+
+    try:
+        bot.remove_webhook()
+        time.sleep(2)
+
+        print("🤖 Starting Telegram polling...")
+        bot.infinity_polling(
+            skip_pending=True,
+            timeout=30,
+            long_polling_timeout=30
+        )
+
+    except Exception as e:
+        print(f"❌ Telegram error: {e}")
+        raise

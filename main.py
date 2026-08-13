@@ -54,7 +54,8 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Add BOT_TOKEN in Render Environment.")
 
 app = Flask(__name__)
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
+bot = telebot.TeleBot("8638334231:AAEZr_3sZ3jbQKg_Syq04CgOnXDWvbTWLdg", parse_mode="Markdown")
+
 
 user_states = {}
 pending_codes = {}

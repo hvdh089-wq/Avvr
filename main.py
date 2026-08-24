@@ -3360,6 +3360,7 @@ def start_server():
 
 
 if __name__ == "__main__":
+    start_server()
 
     server_thread = threading.Thread(
         target=start_server,

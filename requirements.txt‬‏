@@ -1,6 +1,3 @@
-pyTelegramBotAPI
-edge-tts
-gtts
-qrcode[pil]
-Flask
+flask
+flask-sock
 gunicorn

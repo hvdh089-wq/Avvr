@@ -1,1949 +1,440 @@
-
 # -*- coding: utf-8 -*-
-"""
-ASAD: FRONTLINE
-ملف واحد: main.py
-المطور: أسعد المطور
-
-التقنيات:
-  Flask + Flask-SocketIO + Simple-WebSocket
-  HTML/CSS/JavaScript + Three.js
-  Socket.IO للتزامن الفوري
-
-تشغيل محلي:
-  python -m pip install flask flask-socketio simple-websocket
-  python main.py
-
-تشغيل إنتاجي على Render:
-  Build: pip install flask flask-socketio simple-websocket gunicorn
-  Start: gunicorn --worker-class gthread --threads 100 --timeout 120 main:app
-
-ملاحظة: الحالة والنتائج محفوظة في ذاكرة العملية الحالية.
-لا تستخدم أكثر من عامل Gunicorn واحد مع هذا التخزين الداخلي.
-"""
-
-import os
-import re
-import math
-import time
-import secrets
-import threading
-from collections import defaultdict
-from flask import Flask, render_template_string, jsonify, request
-from flask_socketio import SocketIO, emit, join_room, disconnect
-
 # ============================================================
-# 1. إعداد التطبيق
+# ساحة الحديد - لعبة قتال جماعي لثلاثة هواتف | تطوير: أسعد المطور
+# التثبيت (Render Build):  pip install flask flask-sock gunicorn
+# التشغيل  (Render Start): gunicorn -w 1 --threads 100 -b 0.0.0.0:$PORT main:app
+# محلياً: python main.py
+# ملاحظة: يجب عامل واحد فقط (-w 1) لأن الغرف محفوظة في ذاكرة العملية.
 # ============================================================
+import os, time, json, math, random, secrets, threading, re
+from flask import Flask, request, jsonify, Response
+from flask_sock import Sock
 
-GAME_NAME = "ASAD: FRONTLINE"
-DEVELOPER = "أسعد المطور"
-MAX_PLAYERS = 3
-MATCH_SECONDS = 180
-TICK_RATE = 20
-ROOM_TTL = 60 * 60
-TOKEN_TTL = 30 * 60
-
+# ---------- القسم 1: الإعدادات ----------
+GAME_NAME = "ساحة الحديد"          # غيّر اسم اللعبة من هنا
+DEV_NAME = "أسعد المطور"
+W, H = 1600, 1000                   # أبعاد الساحة
+WALLS = [(300,200,40,250),(1260,550,40,250),(700,100,200,40),(700,860,200,40),
+         (500,450,120,100),(980,450,120,100),(150,700,200,40),(1250,260,200,40)]
+ZONE = (800, 500, 110)              # نقطة استراتيجية: س، ص، نصف القطر
+SPAWNS = [(100,100),(1500,900),(1500,100)]
+ALPHA = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+MATCH_SECONDS, MAG, RESERVE, RADIUS = 150, 30, 90, 14
+CODE_TTL = 3 * 3600
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get(
-    "SECRET_KEY", secrets.token_hex(32)
-)
-
-socketio = SocketIO(
-    app,
-    async_mode="threading",
-    cors_allowed_origins=[],
-    ping_interval=20,
-    ping_timeout=35,
-    max_http_buffer_size=100_000,
-)
-
-# لا تُشارك هذه القواميس بين عدة عمليات خادم.
-rooms = {}
-sid_index = {}
-rate_limits = defaultdict(list)
-world_lock = threading.RLock()
-engine_started = False
-
-WORLD_LIMIT = 45.0
-PLAYER_RADIUS = 0.48
-PLAYER_HEIGHT = 1.8
-
-# عوائق ثابتة: x, z, نصف العرض، نصف العمق، الارتفاع
-OBSTACLES = [
-    (-8, -7, 3.5, 1.0, 2.7),
-    (8, -8, 3.0, 1.0, 2.4),
-    (-13, 3, 1.0, 4.0, 3.2),
-    (13, 4, 1.0, 4.0, 3.2),
-    (-5, 12, 3.0, 1.0, 2.5),
-    (6, 12, 3.2, 1.0, 2.5),
-    (0, -16, 5.0, 1.0, 3.0),
-    (-19, -12, 1.0, 3.0, 2.5),
-    (19, 14, 1.0, 4.0, 3.0),
-    (0, 20, 7.0, 1.0, 2.6),
-    (-22, 0, 1.0, 5.0, 3.0),
-    (22, -3, 1.0, 5.0, 3.0),
-    (-3, 2, 1.0, 2.0, 1.8),
-    (4, -2, 1.0, 2.0, 1.8),
-]
-
-SPAWNS = [
-    (-3.0, 0.0),
-    (3.0, 0.0),
-    (0.0, 4.0),
-]
-
-WEAPONS = {
-    "rifle": {
-        "name": "بندقية هجومية",
-        "mag": 30,
-        "reserve": 120,
-        "reload": 1.65,
-        "rate": 0.115,
-        "damage": 22,
-        "range": 34,
-        "spread": 0.045,
-    },
-    "smg": {
-        "name": "رشاش خفيف",
-        "mag": 36,
-        "reserve": 144,
-        "reload": 1.4,
-        "rate": 0.075,
-        "damage": 14,
-        "range": 23,
-        "spread": 0.075,
-    },
-}
-
-
-def now():
-    return time.time()
-
-
-def clean_name(value, default="SOLDIER"):
-    value = str(value or "").strip()
-    value = re.sub(r"[\x00-\x1f<>]", "", value)
-    return value[:22] or default
-
-
-def make_code(length=8):
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    return "".join(secrets.choice(alphabet) for _ in range(length))
-
-
-def make_unique_code():
-    for _ in range(100):
-        code = make_code()
-        if not any(code in r["codes"] for r in rooms.values()):
-            return code
-    raise RuntimeError("تعذر إنشاء رمز فريد")
-
-
-def allowed_rate(sid, action, limit, period=1.0):
-    key = (sid, action)
-    current = now()
-    events = [t for t in rate_limits[key] if current - t < period]
-    if len(events) >= limit:
-        rate_limits[key] = events
-        return False
-    events.append(current)
-    rate_limits[key] = events
-    return True
-
-
-def fresh_player(slot, name, sid=None):
-    x, z = SPAWNS[slot]
-    return {
-        "slot": slot,
-        "name": name,
-        "sid": sid,
-        "connected": sid is not None,
-        "x": x,
-        "z": z,
-        "y": 0.0,
-        "vx": 0.0,
-        "vz": 0.0,
-        "vy": 0.0,
-        "yaw": 0.0 if slot == 0 else math.pi,
-        "pitch": 0.0,
-        "health": 100,
-        "alive": True,
-        "kills": 0,
-        "deaths": 0,
-        "score": 0,
-        "weapon": "rifle",
-        "ammo": WEAPONS["rifle"]["mag"],
-        "reserve": WEAPONS["rifle"]["reserve"],
-        "reloading": False,
-        "reload_until": 0.0,
-        "last_shot": 0.0,
-        "last_grenade": 0.0,
-        "respawn_at": 0.0,
-        "jump_requested": False,
-        "crouch": False,
-        "sprint": False,
-        "aim": False,
-        "fire": False,
-        "interact": False,
-        "grenade": False,
-        "move_x": 0.0,
-        "move_z": 0.0,
-        "last_input": 0.0,
-        "last_seen": now(),
-        "damage_flash": 0,
-    }
-
-
-def new_room(name, host_sid):
-    room_id = secrets.token_urlsafe(7).replace("-", "").replace("_", "")[:10].upper()
-    while room_id in rooms:
-        room_id = secrets.token_urlsafe(7)[:10].upper()
-
-    codes = {
-        "host": make_unique_code(),
-        "controller1": make_unique_code(),
-        "controller2": make_unique_code(),
-    }
-
-    room = {
-        "id": room_id,
-        "name": clean_name(name, "ASAD_BATTLE"),
-        "created": now(),
-        "last_active": now(),
-        "codes": codes,
-        "used_codes": set(),
-        "slots": [None, None, None],
-        "players": {},
-        "host_sid": host_sid,
-        "state": "lobby",
-        "started_at": 0.0,
-        "ends_at": 0.0,
-        "remaining": MATCH_SECONDS,
-        "winner": None,
-        "objective": {"x": 0.0, "z": 0.0, "progress": {}},
-        "revision": 0,
-    }
-    room["slots"][0] = host_sid
-    room["players"][host_sid] = fresh_player(0, "ASAD", host_sid)
-    rooms[room_id] = room
-    sid_index[host_sid] = (room_id, 0)
-    return room
-
-
-def public_room(room):
-    players = []
-    for slot in range(MAX_PLAYERS):
-        sid = room["slots"][slot]
-        p = room["players"].get(sid) if sid else None
-        players.append({
-            "slot": slot,
-            "name": p["name"] if p else (
-                "اللاعب الأساسي" if slot == 0 else f"وحدة التحكم {slot}"
-            ),
-            "connected": bool(p and p["connected"]),
-            "occupied": bool(p),
-            "health": p["health"] if p else 0,
-            "kills": p["kills"] if p else 0,
-            "deaths": p["deaths"] if p else 0,
-            "score": p["score"] if p else 0,
-        })
-    return {
-        "id": room["id"],
-        "name": room["name"],
-        "state": room["state"],
-        "remaining": max(0, int(room["ends_at"] - now()))
-        if room["state"] == "playing" else room["remaining"],
-        "players": players,
-        "winner": room["winner"],
-        "developer": DEVELOPER,
-    }
-
-
-def room_emit(room, event, data):
-    socketio.emit(event, data, to=room["id"])
-
-
-def update_room_status(room):
-    room_emit(room, "room_status", public_room(room))
-
-
-def reset_player_for_match(p):
-    slot = p["slot"]
-    x, z = SPAWNS[slot]
-    p.update({
-        "x": x, "z": z, "y": 0.0,
-        "vx": 0.0, "vz": 0.0, "vy": 0.0,
-        "yaw": 0.0 if slot == 0 else math.pi,
-        "pitch": 0.0,
-        "health": 100, "alive": True,
-        "kills": 0, "deaths": 0, "score": 0,
-        "weapon": "rifle",
-        "ammo": WEAPONS["rifle"]["mag"],
-        "reserve": WEAPONS["rifle"]["reserve"],
-        "reloading": False, "reload_until": 0.0,
-        "last_shot": 0.0, "last_grenade": 0.0,
-        "respawn_at": 0.0,
-        "fire": False, "jump_requested": False,
-        "grenade": False, "move_x": 0.0, "move_z": 0.0,
-    })
-
-
-def start_match(room):
-    if room["state"] == "playing":
-        return False, "المباراة جارية بالفعل"
-    if not room["players"]:
-        return False, "لا يوجد لاعب لبدء المباراة"
-
-    room["state"] = "playing"
-    room["started_at"] = now() + 3.0
-    room["ends_at"] = room["started_at"] + MATCH_SECONDS
-    room["remaining"] = MATCH_SECONDS
-    room["winner"] = None
-    room["objective"]["progress"] = {}
-
-    for p in room["players"].values():
-        reset_player_for_match(p)
-
-    room_emit(room, "match_countdown", {"seconds": 3})
-    update_room_status(room)
-    return True, "بدأت المباراة"
-
-
-def end_match(room, reason="time"):
-    if room["state"] != "playing":
-        return
-    room["state"] = "results"
-    room["remaining"] = max(0, int(room["ends_at"] - now()))
-    room["winner"] = None
-    ranked = sorted(
-        room["players"].values(),
-        key=lambda p: (p["score"], p["kills"], -p["deaths"]),
-        reverse=True,
-    )
-    if ranked:
-        room["winner"] = {
-            "slot": ranked[0]["slot"],
-            "name": ranked[0]["name"],
-            "score": ranked[0]["score"],
-        }
-    room_emit(room, "match_over", {
-        "reason": reason,
-        "winner": room["winner"],
-        "players": [{
-            "slot": p["slot"],
-            "name": p["name"],
-            "kills": p["kills"],
-            "deaths": p["deaths"],
-            "score": p["score"],
-        } for p in ranked],
-    })
-    update_room_status(room)
-
-
-# ============================================================
-# 2. فيزياء وتصادمات الخادم
-# ============================================================
-
-def circle_hits_box(x, z, radius, box):
-    bx, bz, hx, hz, _ = box
-    nearest_x = max(bx - hx, min(x, bx + hx))
-    nearest_z = max(bz - hz, min(z, bz + hz))
-    dx = x - nearest_x
-    dz = z - nearest_z
-    return dx * dx + dz * dz < radius * radius
-
-
-def is_blocked(x, z, radius=PLAYER_RADIUS):
-    if abs(x) > WORLD_LIMIT or abs(z) > WORLD_LIMIT:
-        return True
-    return any(circle_hits_box(x, z, radius, box) for box in OBSTACLES)
-
-
-def move_player(p, dt):
-    if not p["alive"]:
-        return
-
-    # تُرفض الحركة بعد توقف إرسال الأوامر أو فقدان الاتصال.
-    if not p["connected"] or now() - p["last_input"] > 1.0:
-        p["move_x"] = 0.0
-        p["move_z"] = 0.0
-        p["fire"] = False
-        p["sprint"] = False
-
-    mx = max(-1.0, min(1.0, p["move_x"]))
-    mz = max(-1.0, min(1.0, p["move_z"]))
-    magnitude = math.hypot(mx, mz)
-    if magnitude > 1.0:
-        mx /= magnitude
-        mz /= magnitude
-
-    yaw = p["yaw"]
-    # اتجاه أمامي متوافق مع منظور الكاميرا.
-    forward_x = -math.sin(yaw)
-    forward_z = -math.cos(yaw)
-    right_x = math.cos(yaw)
-    right_z = -math.sin(yaw)
-
-    target_x = (right_x * mx + forward_x * mz)
-    target_z = (right_z * mx + forward_z * mz)
-    speed = 8.0 if p["sprint"] else 4.6
-    if p["crouch"]:
-        speed = 2.3
-    if p["aim"]:
-        speed *= 0.78
-
-    target_vx = target_x * speed
-    target_vz = target_z * speed
-    acceleration = 18.0 if magnitude > 0.05 else 13.0
-    blend = min(1.0, acceleration * dt)
-    p["vx"] += (target_vx - p["vx"]) * blend
-    p["vz"] += (target_vz - p["vz"]) * blend
-
-    nx = p["x"] + p["vx"] * dt
-    nz = p["z"] + p["vz"] * dt
-
-    # فصل التصادم على المحورين لتجنب اختراق الزوايا.
-    if not is_blocked(nx, p["z"]):
-        p["x"] = nx
-    else:
-        p["vx"] = 0.0
-    if not is_blocked(p["x"], nz):
-        p["z"] = nz
-    else:
-        p["vz"] = 0.0
-
-    # جاذبية وقَفز تقريبيان على سطح مستوٍ.
-    if p["jump_requested"] and p["y"] <= 0.001:
-        p["vy"] = 6.5
-    p["jump_requested"] = False
-    p["vy"] -= 18.0 * dt
-    p["y"] += p["vy"] * dt
-    if p["y"] < 0:
-        p["y"] = 0.0
-        p["vy"] = 0.0
-
-    p["x"] = max(-WORLD_LIMIT, min(WORLD_LIMIT, p["x"]))
-    p["z"] = max(-WORLD_LIMIT, min(WORLD_LIMIT, p["z"]))
-
-
-def line_hits_obstacle(ax, az, bx, bz):
-    # فحص عينات على مسار المقذوف؛ مناسب لساحة صغيرة.
-    distance = math.hypot(bx - ax, bz - az)
-    samples = max(2, int(distance / 0.35))
-    for i in range(1, samples):
-        t = i / samples
-        x = ax + (bx - ax) * t
-        z = az + (bz - az) * t
-        for box in OBSTACLES:
-            if circle_hits_box(x, z, 0.16, box):
-                return True
-    return False
-
-
-def fire_weapon(room, shooter):
-    current = now()
-    weapon = WEAPONS[shooter["weapon"]]
-
-    if not shooter["connected"] or not shooter["alive"]:
-        return
-    if shooter["reloading"] or shooter["ammo"] <= 0:
-        return
-    if current - shooter["last_shot"] < weapon["rate"]:
-        return
-
-    shooter["last_shot"] = current
-    shooter["ammo"] -= 1
-
-    yaw = shooter["yaw"]
-    pitch = shooter["pitch"]
-    # انحراف صغير متوازن، محسوب على الخادم.
-    spread = weapon["spread"]
-    yaw += secrets.randbelow(10000) / 10000 * spread - spread / 2
-    pitch += secrets.randbelow(10000) / 10000 * spread - spread / 2
-
-    dx = -math.sin(yaw) * math.cos(pitch)
-    dz = -math.cos(yaw) * math.cos(pitch)
-    dy = math.sin(pitch)
-
-    origin_x = shooter["x"]
-    origin_z = shooter["z"]
-    origin_y = shooter["y"] + (0.9 if shooter["crouch"] else 1.45)
-
-    best = None
-    best_distance = weapon["range"]
-    for target in room["players"].values():
-        if target is shooter or not target["alive"] or not target["connected"]:
-            continue
-        tx = target["x"] - origin_x
-        tz = target["z"] - origin_z
-        ty = target["y"] + 0.9 - origin_y
-        projection = tx * dx + tz * dz + ty * dy
-        if projection <= 0 or projection > weapon["range"]:
-            continue
-
-        px = origin_x + dx * projection
-        pz = origin_z + dz * projection
-        py = origin_y + dy * projection
-        target_y = target["y"] + 0.9
-        dist_sq = (
-            (target["x"] - px) ** 2
-            + (target["z"] - pz) ** 2
-            + (target_y - py) ** 2
-        )
-        if dist_sq > 0.95 ** 2 or projection >= best_distance:
-            continue
-        if line_hits_obstacle(origin_x, origin_z, target["x"], target["z"]):
-            continue
-        best = target
-        best_distance = projection
-
-    event = {
-        "slot": shooter["slot"],
-        "x": origin_x,
-        "y": origin_y,
-        "z": origin_z,
-        "dx": dx,
-        "dy": dy,
-        "dz": dz,
-        "distance": best_distance if best else weapon["range"],
-        "hit": best["slot"] if best else None,
-        "weapon": shooter["weapon"],
-    }
-
-    if best:
-        # ضرر المنطقة العلوية عند إصابة الرأس تقريبي.
-        head_hit = abs(best["y"] + 1.55 - (origin_y + dy * best_distance)) < 0.32
-        damage = weapon["damage"] * (1.6 if head_hit else 1.0)
-        best["health"] = max(0, best["health"] - int(damage))
-        best["damage_flash"] = 1
-        room_emit(room, "hit_confirm", {
-            "attacker": shooter["slot"],
-            "target": best["slot"],
-            "damage": int(damage),
-            "head": head_hit,
-        })
-        if best["health"] <= 0:
-            best["alive"] = False
-            best["deaths"] += 1
-            best["respawn_at"] = current + 3.0
-            shooter["kills"] += 1
-            shooter["score"] += 100
-            room_emit(room, "elimination", {
-                "killer": shooter["slot"],
-                "victim": best["slot"],
-            })
-
-    room_emit(room, "shot", event)
-
-
-def reload_weapon(p):
-    if p["reloading"] or p["reserve"] <= 0:
-        return
-    weapon = WEAPONS[p["weapon"]]
-    if p["ammo"] >= weapon["mag"]:
-        return
-    p["reloading"] = True
-    p["reload_until"] = now() + weapon["reload"]
-
-
-def throw_grenade(room, p):
-    current = now()
-    if current - p["last_grenade"] < 4.0 or not p["alive"]:
-        return
-    p["last_grenade"] = current
-
-    yaw = p["yaw"]
-    cx = p["x"] - math.sin(yaw) * 6.0
-    cz = p["z"] - math.cos(yaw) * 6.0
-
-    affected = []
-    for target in room["players"].values():
-        if target is p or not target["alive"]:
-            continue
-        distance = math.hypot(target["x"] - cx, target["z"] - cz)
-        if distance > 5.0:
-            continue
-        if line_hits_obstacle(cx, cz, target["x"], target["z"]):
-            continue
-        damage = int(65 * (1 - distance / 6.0))
-        if damage <= 0:
-            continue
-        target["health"] = max(0, target["health"] - damage)
-        target["damage_flash"] = 1
-        affected.append({"slot": target["slot"], "damage": damage})
-        if target["health"] <= 0:
-            target["alive"] = False
-            target["deaths"] += 1
-            target["respawn_at"] = current + 3.0
-            p["kills"] += 1
-            p["score"] += 100
-
-    room_emit(room, "explosion", {
-        "x": cx, "z": cz, "affected": affected, "by": p["slot"]
-    })
-
-
-def game_tick():
-    last = now()
+sock = Sock(app)
+LOCK = threading.RLock()
+ROOMS, CODES, RATE = {}, {}, {}
+
+# ---------- القسم 2: منطق الغرف (السيرفر هو المرجع) ----------
+def new_code():
     while True:
-        tick_start = now()
-        dt = max(0.001, min(0.08, tick_start - last))
-        last = tick_start
-
-        with world_lock:
-            stale_rooms = []
-            for room_id, room in list(rooms.items()):
-                if tick_start - room["last_active"] > ROOM_TTL:
-                    stale_rooms.append(room_id)
-                    continue
-
-                if room["state"] != "playing":
-                    continue
-                if tick_start < room["started_at"]:
-                    continue
-                if tick_start >= room["ends_at"]:
-                    end_match(room, "time")
-                    continue
-
-                # نقطة سيطرة في وسط الساحة: تمنح نقاطاً عند البقاء قريباً.
-                active_near = []
-                for p in room["players"].values():
-                    if p["connected"] and p["alive"] and math.hypot(p["x"], p["z"]) < 3.2:
-                        active_near.append(p)
-
-                if len(active_near) == 1:
-                    active_near[0]["score"] += dt * 2.0
-
-                for p in list(room["players"].values()):
-                    p["last_seen"] = tick_start
-                    if p["damage_flash"]:
-                        p["damage_flash"] = 0
-
-                    if p["reloading"] and tick_start >= p["reload_until"]:
-                        weapon = WEAPONS[p["weapon"]]
-                        needed = weapon["mag"] - p["ammo"]
-                        loaded = min(needed, p["reserve"])
-                        p["ammo"] += loaded
-                        p["reserve"] -= loaded
-                        p["reloading"] = False
-
-                    if not p["alive"]:
-                        if p["connected"] and tick_start >= p["respawn_at"]:
-                            slot = p["slot"]
-                            x, z = SPAWNS[slot]
-                            p["x"], p["z"], p["y"] = x, z, 0
-                            p["vx"], p["vz"], p["vy"] = 0, 0, 0
-                            p["health"] = 100
-                            p["alive"] = True
-                            p["ammo"] = WEAPONS[p["weapon"]]["mag"]
-                            p["reserve"] = max(p["reserve"], 60)
-                            room_emit(room, "respawn", {"slot": slot})
-                        continue
-
-                    move_player(p, dt)
-
-                    if p["fire"]:
-                        fire_weapon(room, p)
-                    if p["grenade"]:
-                        p["grenade"] = False
-                        throw_grenade(room, p)
-
-                room["remaining"] = max(0, int(room["ends_at"] - tick_start))
-                room["revision"] += 1
-
-                # إرسال حالة صغيرة نسبياً بمعدل 10 تحديثات/ثانية.
-                if room["revision"] % 2 == 0:
-                    snapshot = {
-                        "state": room["state"],
-                        "remaining": room["remaining"],
-                        "players": [{
-                            "slot": p["slot"],
-                            "name": p["name"],
-                            "connected": p["connected"],
-                            "x": round(p["x"], 3),
-                            "y": round(p["y"], 3),
-                            "z": round(p["z"], 3),
-                            "yaw": p["yaw"],
-                            "pitch": p["pitch"],
-                            "health": p["health"],
-                            "alive": p["alive"],
-                            "kills": p["kills"],
-                            "deaths": p["deaths"],
-                            "score": int(p["score"]),
-                            "weapon": p["weapon"],
-                            "ammo": p["ammo"],
-                            "reserve": p["reserve"],
-                            "reloading": p["reloading"],
-                            "crouch": p["crouch"],
-                            "sprint": p["sprint"],
-                        } for p in room["players"].values()],
-                    }
-                    room_emit(room, "snapshot", snapshot)
-
-                if room["revision"] % 10 == 0:
-                    update_room_status(room)
-
-            for room_id in stale_rooms:
-                room = rooms.pop(room_id, None)
-                if room:
-                    for sid in list(room["players"].keys()):
-                        sid_index.pop(sid, None)
-
-        socketio.sleep(1.0 / TICK_RATE)
-
-
-def start_engine_once():
-    global engine_started
-    if not engine_started:
-        engine_started = True
-        socketio.start_background_task(game_tick)
-
-
-# ============================================================
-# 3. صفحات الويب المولّدة داخل Python
-# ============================================================
-
-PAGE = r"""
-<!doctype html>
-<html lang="ar" dir="rtl">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-<meta name="theme-color" content="#0a1015">
-<title>ASAD: FRONTLINE</title>
-<style>
-:root{
- --bg:#080d11;--panel:#101a20;--panel2:#17242a;--line:#2d4248;
- --text:#eaf2ef;--muted:#91a7a6;--lime:#c7f36b;--cyan:#64e1d3;
- --red:#ff626a;--gold:#e6c879;--safe-top:env(safe-area-inset-top,0px);
- --safe-bottom:env(safe-area-inset-bottom,0px);
-}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{margin:0;width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--text);
- font-family:system-ui,-apple-system,"Segoe UI",Arial,sans-serif;touch-action:none}
-button,input{font:inherit}
-button{cursor:pointer;color:var(--text);border:1px solid var(--line);background:#17242a;
- border-radius:12px;padding:12px 16px;user-select:none}
-button:active{transform:scale(.97);filter:brightness(1.2)}
-button:disabled{opacity:.4}
-input{width:100%;padding:14px;border-radius:10px;border:1px solid var(--line);
- background:#080f13;color:var(--text);outline:none}
-input:focus{border-color:var(--lime)}
-.hidden{display:none!important}
-#world{position:fixed;inset:0;width:100%;height:100%;display:block}
-.screen{position:fixed;inset:0;overflow:auto;padding:calc(20px + var(--safe-top)) 18px calc(20px + var(--safe-bottom));
- background:linear-gradient(145deg,rgba(7,13,17,.96),rgba(9,19,23,.91)),radial-gradient(ellipse at 65% 20%,#263c38,transparent 60%);
- z-index:4}
-.center{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
-.logo{font-size:clamp(28px,7vw,52px);font-weight:950;letter-spacing:2px;line-height:1.05}
-.logo span{color:var(--lime)}
-.kicker{color:var(--cyan);letter-spacing:3px;font-size:11px;font-weight:800;margin-bottom:13px}
-.subtitle{color:var(--muted);font-size:13px;line-height:1.8;max-width:390px}
-.brand{position:absolute;bottom:calc(15px + var(--safe-bottom));font-size:12px;color:#8da19f}
-.brand b{color:var(--lime);font-weight:700}
-.home-actions{width:min(100%,370px);display:grid;gap:12px;margin-top:34px}
-.primary{background:var(--lime);color:#11170a;border-color:var(--lime);font-weight:900}
-.secondary{background:rgba(19,34,39,.9);font-weight:750}
-.panel{width:min(100%,540px);margin:0 auto;border:1px solid var(--line);border-radius:17px;
- background:rgba(14,24,29,.95);padding:18px;box-shadow:0 22px 80px #0007}
-.panel h2{font-size:21px;margin:0 0 8px}
-.label{font-size:12px;color:var(--muted);display:block;margin:15px 0 7px}
-.row{display:flex;gap:9px;align-items:center}
-.row>*{min-width:0}
-.grow{flex:1}
-.note{color:var(--muted);font-size:12px;line-height:1.7}
-.status{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--muted)}
-.dot{width:8px;height:8px;border-radius:50%;background:#607177;display:inline-block}
-.dot.on{background:var(--lime);box-shadow:0 0 12px #c7f36b88}
-.dot.off{background:var(--red)}
-.token-row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;margin-top:10px}
-.token{direction:ltr;text-align:center;font-weight:900;letter-spacing:3px;color:var(--lime);
- background:#070d10;padding:12px;border:1px dashed #435c57;border-radius:9px}
-.player-row{display:flex;justify-content:space-between;gap:8px;padding:12px 0;border-bottom:1px solid #223238}
-.player-row:last-child{border-bottom:0}
-.badge{font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:30px;padding:4px 7px}
-#hud{position:fixed;z-index:2;inset:0;pointer-events:none}
-.hud-top{position:absolute;top:calc(10px + var(--safe-top));left:10px;right:10px;display:flex;justify-content:space-between;gap:8px;align-items:flex-start}
-.hud-box{background:#071015d9;border:1px solid #34484c;border-radius:9px;padding:8px 11px;backdrop-filter:blur(8px)}
-.hud-label{font-size:9px;letter-spacing:1.4px;color:var(--muted)}
-.hud-value{font-weight:900;font-size:17px}
-.healthbar{height:5px;background:#394549;border-radius:10px;overflow:hidden;margin-top:5px;width:130px}
-.healthbar>div{height:100%;width:100%;background:var(--lime);transition:width .15s}
-#crosshair{position:absolute;left:50%;top:50%;width:20px;height:20px;transform:translate(-50%,-50%)}
-#crosshair:before,#crosshair:after{content:"";position:absolute;background:#dff9e8;box-shadow:0 0 5px #000}
-#crosshair:before{width:2px;height:18px;left:9px;top:1px}
-#crosshair:after{height:2px;width:18px;left:1px;top:9px}
-#message{position:absolute;top:25%;left:50%;transform:translateX(-50%);padding:9px 16px;
- border-radius:9px;background:#0a1419e8;border:1px solid var(--lime);font-size:13px;white-space:nowrap}
-#minimap{position:absolute;left:12px;bottom:12px;width:100px;height:100px;border-radius:50%;
- border:1px solid #79908a;background:#071015bb}
-#controls{position:fixed;inset:0;z-index:3;pointer-events:none}
-.stick{position:absolute;bottom:calc(25px + var(--safe-bottom));width:132px;height:132px;border-radius:50%;
- border:1px solid #d7eee755;background:#14252c77;pointer-events:auto;touch-action:none}
-#moveStick{left:18px}
-#lookStick{right:18px}
-.stick:before{content:"";position:absolute;inset:20%;border:1px solid #d7eee733;border-radius:50%}
-.knob{position:absolute;left:50%;top:50%;width:48px;height:48px;border-radius:50%;transform:translate(-50%,-50%);
- background:#c7f36bcc;border:2px solid #efffdc;box-shadow:0 3px 18px #0008}
-.action{position:absolute;pointer-events:auto;touch-action:none;border-radius:50%;width:58px;height:58px;
- padding:0;background:#13262dd9;border:1px solid #c7f36b99;color:#e9f6ef;font-size:11px;font-weight:800;
- display:flex;align-items:center;justify-content:center}
-#fireBtn{right:158px;bottom:calc(42px + var(--safe-bottom));width:72px;height:72px;background:#a93b3bd9;border-color:#ff8585}
-#aimBtn{right:169px;bottom:calc(122px + var(--safe-bottom))}
-#reloadBtn{right:105px;bottom:calc(154px + var(--safe-bottom))}
-#jumpBtn{right:22px;bottom:calc(150px + var(--safe-bottom))}
-#crouchBtn{right:82px;bottom:calc(222px + var(--safe-bottom))}
-#sprintBtn{left:145px;bottom:calc(30px + var(--safe-bottom))}
-#switchBtn{right:25px;bottom:calc(225px + var(--safe-bottom))}
-#grenadeBtn{right:92px;bottom:calc(90px + var(--safe-bottom))}
-#interactBtn{left:155px;bottom:calc(100px + var(--safe-bottom))}
-#gameTopButtons{position:absolute;top:calc(65px + var(--safe-top));right:12px;display:flex;gap:6px;pointer-events:auto}
-.smallbtn{font-size:10px;padding:7px 10px}
-#pauseScreen,#resultScreen{z-index:8;background:#050a0deF}
-.settings-grid{display:grid;gap:12px;margin-top:15px}
-.settings-grid label{font-size:12px;color:var(--muted)}
-.settings-grid input[type=range]{padding:0;accent-color:var(--lime)}
-#controllerInfo{position:fixed;z-index:2;top:calc(10px + var(--safe-top));left:50%;transform:translateX(-50%);
- background:#071015d9;border:1px solid #34484c;border-radius:9px;padding:8px 13px;text-align:center;
- width:max-content;max-width:90%}
-#toast{position:fixed;z-index:20;left:50%;top:calc(15px + var(--safe-top));transform:translateX(-50%);
- background:#13252a;border:1px solid var(--lime);border-radius:9px;padding:11px 16px;display:none;
- max-width:90%;font-size:13px}
-@media(max-width:390px){
- .stick{width:112px;height:112px}
- .knob{width:42px;height:42px}
- #moveStick{left:10px}#lookStick{right:10px}
- #fireBtn{right:127px;width:64px;height:64px}
- #aimBtn{right:140px;bottom:calc(110px + var(--safe-bottom))}
- #reloadBtn{right:85px;bottom:calc(140px + var(--safe-bottom))}
- #jumpBtn{right:13px;bottom:calc(135px + var(--safe-bottom))}
- #crouchBtn{right:65px;bottom:calc(205px + var(--safe-bottom))}
- #switchBtn{right:14px;bottom:calc(205px + var(--safe-bottom))}
- #grenadeBtn{right:70px;bottom:calc(80px + var(--safe-bottom))}
- #interactBtn{left:126px}
-}
-@media(orientation:portrait) and (max-height:650px){
- .stick{width:95px;height:95px}
- .action{width:48px;height:48px;font-size:9px}
- #fireBtn{width:60px;height:60px}
-}
-</style>
-</head>
-<body>
-<canvas id="world"></canvas>
-
-<section id="home" class="screen center">
- <div class="kicker">TACTICAL COMBAT SYSTEMS</div>
- <div class="logo">ASAD <span>:</span><br>FRONTLINE</div>
- <p class="subtitle">ساحة قتال تكتيكية مصغرة. تحرك، سيطر على المركز، وحقق أعلى نتيجة.</p>
- <div class="home-actions">
-  <button id="hostEntry" class="primary">إنشاء غرفة واللعب</button>
-  <button id="controllerEntry" class="secondary">وحدة التحكم</button>
- </div>
- <div class="brand">تطوير <b>أسعد المطور</b></div>
-</section>
-
-<section id="createScreen" class="screen hidden">
- <div class="panel">
-  <div class="kicker">ROOM COMMAND</div>
-  <h2>إنشاء غرفة معركة</h2>
-  <p class="note">أنشئ غرفة فعلية على الخادم. احتفظ بالرموز ولا تشارك رمز الجهاز الأساسي.</p>
-  <label class="label" for="roomName">اسم الغرفة</label>
-  <input id="roomName" maxlength="22" value="ASAD_BATTLE" autocomplete="off">
-  <label class="label" for="playerName">اسم اللاعب الأساسي</label>
-  <input id="playerName" maxlength="22" value="ASAD" autocomplete="off">
-  <div class="row" style="margin-top:16px">
-   <button id="createRoomBtn" class="primary grow">إنشاء الغرفة</button>
-   <button id="backHome1">رجوع</button>
-  </div>
-  <p class="note" id="createError"></p>
- </div>
- <div class="brand">تطوير <b>أسعد المطور</b></div>
-</section>
-
-<section id="roomScreen" class="screen hidden">
- <div class="panel">
-  <div class="kicker">SECURE LOBBY</div>
-  <h2 id="roomTitle">غرفة المعركة</h2>
-  <div class="row" style="justify-content:space-between;margin:10px 0">
-   <span class="note">معرّف الغرفة</span><b id="roomId" dir="ltr"></b>
-   <span class="badge" id="roomCount">1 / 3</span>
-  </div>
-  <div id="playersList"></div>
-  <label class="label">رمز الجهاز الأساسي — لاستخدام شاشة اللعبة</label>
-  <div class="token-row"><div id="hostToken" class="token">--------</div><button data-copy="hostToken">نسخ</button></div>
-  <label class="label">رمز وحدة التحكم الأولى</label>
-  <div class="token-row"><div id="controllerToken1" class="token">--------</div><button data-copy="controllerToken1">نسخ</button></div>
-  <label class="label">رمز وحدة التحكم الثانية</label>
-  <div class="token-row"><div id="controllerToken2" class="token">--------</div><button data-copy="controllerToken2">نسخ</button></div>
-  <p class="note">أرسل الرمز الأول لوحدة التحكم للهاتف الثاني، والثاني للهاتف الثالث. الرموز منفصلة ومخصصة لكل دور.</p>
-  <div class="row" style="margin-top:14px">
-   <button id="startBtn" class="primary grow">بدء المباراة</button>
-   <button id="rotateTokensBtn">تجديد الرموز</button>
-  </div>
-  <div class="row" style="margin-top:9px">
-   <button id="enterGameBtn" class="secondary grow">الدخول إلى ساحة المعركة</button>
-   <button id="cancelRoomBtn">إلغاء الغرفة</button>
-  </div>
-  <p id="roomError" class="note"></p>
- </div>
- <div class="brand">تطوير <b>أسعد المطور</b></div>
-</section>
-
-<section id="controllerScreen" class="screen center hidden">
- <div class="panel">
-  <div class="kicker">REMOTE LINK</div>
-  <h2>ربط وحدة التحكم</h2>
-  <p class="note">أدخل رمز وحدة التحكم المخصص لهذا الهاتف. لا تستخدم رمز الجهاز الأساسي.</p>
-  <label class="label" for="joinToken">رمز الاتصال</label>
-  <input id="joinToken" maxlength="12" placeholder="أدخل الرمز" autocomplete="off" autocapitalize="characters" dir="ltr">
-  <label class="label" for="controllerName">اسم اللاعب</label>
-  <input id="controllerName" maxlength="22" placeholder="SOLDIER 02" value="SOLDIER">
-  <div class="row" style="margin-top:15px">
-   <button id="joinBtn" class="primary grow">اتصال</button>
-   <button id="backHome2">رجوع</button>
-  </div>
-  <p id="joinError" class="note"></p>
-  <div class="status" style="margin-top:12px"><i id="joinDot" class="dot"></i><span id="joinStatus">غير متصل</span></div>
- </div>
- <div class="brand">تطوير <b>أسعد المطور</b></div>
-</section>
-
-<div id="hud" class="hidden">
- <div class="hud-top">
-  <div class="hud-box">
-   <div class="hud-label">HEALTH / الصحة</div>
-   <div class="hud-value" id="healthValue">100</div>
-   <div class="healthbar"><div id="healthFill"></div></div>
-  </div>
-  <div class="hud-box" style="text-align:center">
-   <div class="hud-label">TIME / الوقت</div><div class="hud-value" id="timeValue">03:00</div>
-   <div class="hud-label" id="playerCountHud">PLAYERS 1/3</div>
-  </div>
-  <div class="hud-box" style="text-align:left;direction:ltr">
-   <div class="hud-label" id="weaponName">RIFLE</div>
-   <div class="hud-value"><span id="ammoValue">30</span><span style="color:#718984"> / </span><span id="reserveValue">120</span></div>
-   <div class="hud-label">AMMO</div>
-  </div>
- </div>
- <div id="crosshair"></div>
- <div id="message" class="hidden"></div>
- <canvas id="minimap" width="180" height="180"></canvas>
- <div id="gameTopButtons"><button class="smallbtn" id="pauseBtn">إيقاف / إعدادات</button></div>
-</div>
-
-<div id="controls" class="hidden">
- <div id="moveStick" class="stick"><div class="knob"></div></div>
- <div id="lookStick" class="stick"><div class="knob"></div></div>
- <button id="fireBtn" class="action">إطلاق</button>
- <button id="aimBtn" class="action">تصويب</button>
- <button id="reloadBtn" class="action">تلقيم</button>
- <button id="jumpBtn" class="action">قفز</button>
- <button id="crouchBtn" class="action">انحناء</button>
- <button id="sprintBtn" class="action">ركض</button>
- <button id="switchBtn" class="action">السلاح</button>
- <button id="grenadeBtn" class="action">قنبلة</button>
- <button id="interactBtn" class="action">تفاعل</button>
-</div>
-
-<div id="controllerInfo" class="hidden">
- <div class="status"><i id="connectionDot" class="dot on"></i><b id="connectionText">متصل</b></div>
- <div class="note" id="controllerPlayerLabel">وحدة التحكم</div>
-</div>
-
-<section id="pauseScreen" class="screen center hidden">
- <div class="panel">
-  <div class="kicker">SYSTEM MENU</div><h2>الإعدادات</h2>
-  <div class="settings-grid">
-   <label>حساسية التصويب <span id="sensLabel">1.0</span>
-    <input id="sensRange" type="range" min="0.4" max="2.2" step="0.1" value="1">
-   </label>
-   <label>حجم الأزرار <span id="sizeLabel">100%</span>
-    <input id="sizeRange" type="range" min="80" max="125" step="5" value="100">
-   </label>
-   <label>شفافية التحكم <span id="opacityLabel">75%</span>
-    <input id="opacityRange" type="range" min="35" max="100" step="5" value="75">
-   </label>
-   <label>جودة الرسومات
-    <select id="qualitySelect" style="width:100%;padding:10px;background:#081015;color:white;border:1px solid var(--line);border-radius:8px">
-     <option value="low">منخفضة</option><option value="medium" selected>متوسطة</option><option value="high">عالية</option>
-    </select>
-   </label>
-   <label><input id="invertY" type="checkbox" style="width:auto"> عكس محور التصويب العمودي</label>
-   <label><input id="soundToggle" type="checkbox" checked style="width:auto"> تفعيل الصوت</label>
-  </div>
-  <div class="row" style="margin-top:18px">
-   <button id="resumeBtn" class="primary grow">متابعة المباراة</button>
-   <button id="backLobbyBtn">العودة للغرفة</button>
-  </div>
-  <div class="note" style="margin-top:10px">ASAD: FRONTLINE — أسعد المطور</div>
- </div>
-</section>
-
-<section id="resultScreen" class="screen center hidden">
- <div class="panel">
-  <div class="kicker">MISSION DEBRIEF</div><h2 id="resultTitle">انتهت المباراة</h2>
-  <p class="subtitle" id="winnerText"></p>
-  <div id="resultsList"></div>
-  <div class="row" style="margin-top:16px">
-   <button id="replayBtn" class="primary grow">إعادة المباراة</button>
-   <button id="resultsLobbyBtn">العودة إلى الغرفة</button>
-  </div>
- </div>
- <div class="brand">تطوير <b>أسعد المطور</b></div>
-</section>
-
-<div id="toast"></div>
-
-<script src="/socket.io/socket.io.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
-<script>
-(() => {
-"use strict";
-
-const $ = id => document.getElementById(id);
-const socket = io({transports:["websocket","polling"], reconnection:true, reconnectionAttempts:Infinity});
-let role = null, roomId = null, playerSlot = null, roomCodes = null;
-let connected = false, inGame = false, matchState = "lobby";
-let latestSnapshot = null, lastSnapshotAt = 0, toastTimer = null;
-let audioContext = null, renderer = null, scene = null, camera = null;
-let localMeshes = new Map(), effects = [], lastFrame = performance.now();
-let cameraYaw = 0, cameraPitch = -0.12, localSettings = {
- sensitivity:1, size:100, opacity:75, quality:"medium", invertY:false, sound:true
-};
-let control = {
- moveX:0, moveZ:0, yawDelta:0, pitchDelta:0, fire:false, aim:false,
- sprint:false, crouch:false, jump:false, reload:false, grenade:false,
- interact:false, switchWeapon:false
-};
-let sendTimer = 0, lastFireSound = 0, inputSeq = 0, lastInputSend = 0;
-let pointerState = new Map();
-let localLookPointer = null;
-
-function showScreen(id) {
- ["home","createScreen","roomScreen","controllerScreen"].forEach(x => $(x).classList.add("hidden"));
- if (id) $(id).classList.remove("hidden");
-}
-function toast(text, bad=false) {
- const el=$("toast"); el.textContent=text; el.style.display="block";
- el.style.borderColor=bad?"var(--red)":"var(--lime)";
- clearTimeout(toastTimer); toastTimer=setTimeout(()=>el.style.display="none",2600);
-}
-function errorText(id,text) { $(id).textContent=text || ""; }
-function emitAck(event,data,callback) {
- socket.timeout(7000).emit(event,data,(err,response)=>{
-  if(err) { callback({ok:false,error:"تعذر الوصول إلى السيرفر أو انتهت مهلة الاتصال"}); return; }
-  callback(response || {ok:false,error:"استجابة غير صالحة من السيرفر"});
- });
-}
-function setConnected(v) {
- connected=v;
- $("connectionDot").className="dot "+(v?"on":"off");
- $("connectionText").textContent=v?"متصل بالخادم":"انقطع الاتصال";
-}
-socket.on("connect",()=>{
- setConnected(true);
- if(role==="host" && roomId) {
-  // لا تُنشأ هوية جديدة تلقائياً بعد انقطاع المقبس.
-  // يجب على المضيف إعادة إنشاء الغرفة إذا فُقدت جلسة الخادم.
-  toast("تم الاتصال بالخادم");
- }
-});
-socket.on("disconnect",()=> {
- setConnected(false);
- control.fire=false; control.moveX=0; control.moveZ=0;
- toast("انقطع الاتصال. توقفت الأوامر المستمرة.",true);
-});
-socket.on("connect_error",()=>setConnected(false));
-socket.on("server_error",d=>toast(d.error || "حدث خطأ",true));
-
-$("hostEntry").onclick=()=>showScreen("createScreen");
-$("controllerEntry").onclick=()=>showScreen("controllerScreen");
-$("backHome1").onclick=()=>showScreen("home");
-$("backHome2").onclick=()=>showScreen("home");
-
-$("createRoomBtn").onclick=()=>{
- errorText("createError","");
- if(!socket.connected){errorText("createError","السيرفر غير متاح. تحقق من الإنترنت ثم أعد المحاولة.");return;}
- $("createRoomBtn").disabled=true;
- emitAck("create_room",{
-  name:$("roomName").value,
-  player_name:$("playerName").value
- },res=>{
-  $("createRoomBtn").disabled=false;
-  if(!res.ok){errorText("createError",res.error);return;}
-  role="host";roomId=res.room.id;playerSlot=0;roomCodes=res.codes;
-  renderRoom(res.room);showScreen("roomScreen");
-  toast("تم إنشاء الغرفة على الخادم");
- });
-};
-
-function renderRoom(data) {
- $("roomTitle").textContent=data.name;
- $("roomId").textContent=data.id;
- $("roomCount").textContent=data.players.filter(p=>p.occupied).length+" / 3";
- if(roomCodes){
-  $("hostToken").textContent=roomCodes.host;
-  $("controllerToken1").textContent=roomCodes.controller1;
-  $("controllerToken2").textContent=roomCodes.controller2;
- }
- $("playersList").innerHTML="";
- data.players.forEach(p=>{
-  const row=document.createElement("div");row.className="player-row";
-  const left=document.createElement("div");
-  const name=document.createElement("b");name.textContent=p.name;
-  const sub=document.createElement("div");sub.className="note";
-  sub.textContent=p.occupied?(p.connected?"متصل بالخادم":"انقطع الاتصال"):"بانتظار الاتصال";
-  left.append(name,sub);
-  const right=document.createElement("span");
-  right.className="status";
-  const dot=document.createElement("i");dot.className="dot "+(p.connected?"on":p.occupied?"off":"");
-  const label=document.createElement("span");label.textContent=p.connected?"متصل":p.occupied?"منقطع":"فارغ";
-  right.append(dot,label);row.append(left,right);$("playersList").append(row);
- });
-}
-socket.on("room_status",data=>{
- if(data.id===roomId && role==="host") renderRoom(data);
-});
-
-document.querySelectorAll("[data-copy]").forEach(btn=>{
- btn.onclick=async()=>{
-  const value=$(btn.dataset.copy).textContent;
-  try {await navigator.clipboard.writeText(value);toast("تم نسخ الرمز");}
-  catch(e){const ta=document.createElement("textarea");ta.value=value;document.body.append(ta);ta.select();document.execCommand("copy");ta.remove();toast("تم نسخ الرمز");}
- };
-});
-
-$("startBtn").onclick=()=>{
- if(role!=="host")return;
- emitAck("start_match",{room_id:roomId},res=>{
-  if(!res.ok){errorText("roomError",res.error);return;}
-  errorText("roomError","بدأت المباراة. اضغط «الدخول إلى ساحة المعركة» على هذا الهاتف.");
-  toast("بدأ العد التنازلي");
- });
-};
-$("rotateTokensBtn").onclick=()=>{
- if(!confirm("سيتم إبطال الرموز الحالية. هل تريد المتابعة؟"))return;
- emitAck("rotate_codes",{room_id:roomId},res=>{
-  if(!res.ok){errorText("roomError",res.error);return;}
-  roomCodes=res.codes;renderRoom(res.room);toast("تم تجديد الرموز");
- });
-};
-$("cancelRoomBtn").onclick=()=>{
- if(!confirm("هل تريد إلغاء الغرفة وفصل وحدات التحكم؟"))return;
- emitAck("cancel_room",{room_id:roomId},res=>{
-  if(!res.ok){errorText("roomError",res.error);return;}
-  leaveGame();role=null;roomId=null;roomCodes=null;showScreen("home");
- });
-};
-$("enterGameBtn").onclick=()=>enterGame();
-
-$("joinBtn").onclick=()=>{
- errorText("joinError","");
- if(!socket.connected){errorText("joinError","السيرفر غير متاح حالياً.");return;}
- const token=$("joinToken").value.trim().toUpperCase();
- if(!token){errorText("joinError","أدخل رمز الاتصال.");return;}
- $("joinBtn").disabled=true;
- emitAck("join_controller",{
-  code:token,name:$("controllerName").value
- },res=>{
-  $("joinBtn").disabled=false;
-  if(!res.ok){errorText("joinError",res.error);$("joinDot").className="dot off";$("joinStatus").textContent="فشل الاتصال";return;}
-  role="controller";roomId=res.room.id;playerSlot=res.slot;
-  $("joinDot").className="dot on";$("joinStatus").textContent="تم الاتصال بنجاح";
-  $("controllerPlayerLabel").textContent="وحدة التحكم "+(res.slot);
-  showController();toast("تم الاتصال بالغرفة");
- });
-};
-
-function showController() {
- ["home","createScreen","roomScreen","controllerScreen"].forEach(x=>$(x).classList.add("hidden"));
- $("hud").classList.add("hidden");
- $("controls").classList.remove("hidden");
- $("controllerInfo").classList.remove("hidden");
- $("pauseScreen").classList.add("hidden");
- $("resultScreen").classList.add("hidden");
- inGame=true;
- applySettings();
-}
-
-function enterGame() {
- if(role!=="host" || !roomId)return;
- emitAck("enter_game",{room_id:roomId},res=>{
-  if(!res.ok){toast(res.error,true);return;}
-  ["home","createScreen","roomScreen","controllerScreen"].forEach(x=>$(x).classList.add("hidden"));
-  $("hud").classList.remove("hidden");$("controls").classList.remove("hidden");
-  $("controllerInfo").classList.add("hidden");
-  $("pauseScreen").classList.add("hidden");$("resultScreen").classList.add("hidden");
-  inGame=true;applySettings();ensureRenderer();toast("تم دخول ساحة المعركة");
- });
-}
-function leaveGame() {
- control.fire=false;control.moveX=0;control.moveZ=0;
- $("hud").classList.add("hidden");$("controls").classList.add("hidden");
- $("controllerInfo").classList.add("hidden");
- $("pauseScreen").classList.add("hidden");$("resultScreen").classList.add("hidden");
- inGame=false;
-}
-
-$("pauseBtn").onclick=()=>{if(role==="host"){$("pauseScreen").classList.remove("hidden");control.fire=false;}};
-$("resumeBtn").onclick=()=>$("pauseScreen").classList.add("hidden");
-$("backLobbyBtn").onclick=()=>{
- if(role!=="host")return;
- leaveGame();showScreen("roomScreen");
-};
-$("backLobbyBtn").title="العودة إلى غرفة المضيف";
-
-$("replayBtn").onclick=()=>{
- if(role!=="host")return;
- emitAck("start_match",{room_id:roomId},res=>{
-  if(!res.ok){toast(res.error,true);return;}
-  $("resultScreen").classList.add("hidden");$("hud").classList.remove("hidden");
-  $("controls").classList.remove("hidden");inGame=true;toast("بدأت مباراة جديدة");
- });
-};
-$("resultsLobbyBtn").onclick=()=>{
- if(role==="host"){leaveGame();showScreen("roomScreen");}
- else {$("resultScreen").classList.add("hidden");showController();}
-};
-
-socket.on("match_countdown",d=>toast("بدء المباراة خلال "+d.seconds+" ثوانٍ"));
-socket.on("match_over",d=>{
- control.fire=false;control.moveX=0;control.moveZ=0;
- $("hud").classList.add("hidden");$("controls").classList.add("hidden");
- $("pauseScreen").classList.add("hidden");$("resultScreen").classList.remove("hidden");
- inGame=false;
- $("winnerText").textContent=d.winner?"الفائز: "+d.winner.name+" — "+d.winner.score+" نقطة":"انتهت المباراة";
- $("resultsList").innerHTML="";
- (d.players||[]).forEach(p=>{
-  const row=document.createElement("div");row.className="player-row";
-  const a=document.createElement("b");a.textContent=p.name;
-  const b=document.createElement("span");b.textContent=p.score+" نقطة · "+p.kills+" إقصاء · "+p.deaths+" خسارة";
-  row.append(a,b);$("resultsList").append(row);
- });
-});
-socket.on("match_started",()=>toast("بدأت المعركة"));
-socket.on("respawn",d=>{if(d.slot===playerSlot)toast("تمت إعادة الظهور");});
-socket.on("elimination",d=>{
- if(d.killer===playerSlot)toast("تم إقصاء الخصم");
- else if(d.victim===playerSlot)toast("تم إقصاؤك",true);
-});
-socket.on("hit_confirm",d=>{
- if(d.attacker===playerSlot)toast("إصابة مؤكدة · "+d.damage);
- if(d.target===playerSlot)screenFlash();
-});
-socket.on("shot",d=>{
- spawnTracer(d);
- if(d.slot!==playerSlot)playTone(110,0.045,"sawtooth",0.04);
- else playTone(80,0.055,"square",0.035);
-});
-socket.on("explosion",d=>spawnExplosion(d.x,d.z));
-socket.on("snapshot",d=>{
- latestSnapshot=d;lastSnapshotAt=performance.now();matchState=d.state;
- if(inGame)updateHud(d);
-});
-socket.on("room_status",d=>{
- if(role==="controller" && d.id===roomId && d.state==="playing") {
-  // لا نبدّل الشاشة قسراً؛ وحدة التحكم تبقى جاهزة.
- }
-});
-
-function screenFlash(){
- const el=document.createElement("div");
- el.style.cssText="position:fixed;inset:0;z-index:7;pointer-events:none;background:#f44;opacity:.25";
- document.body.append(el);setTimeout(()=>el.remove(),100);
-}
-function updateHud(d) {
- $("timeValue").textContent=String(Math.floor(d.remaining/60)).padStart(2,"0")+":"+String(d.remaining%60).padStart(2,"0");
- $("playerCountHud").textContent="PLAYERS "+d.players.filter(p=>p.connected).length+"/3";
- const me=d.players.find(p=>p.slot===playerSlot);
- if(me){
-  $("healthValue").textContent=me.health;
-  $("healthFill").style.width=me.health+"%";
-  $("ammoValue").textContent=me.ammo;
-  $("reserveValue").textContent=me.reserve;
-  $("weaponName").textContent=me.weapon==="smg"?"SMG":"RIFLE";
- }
- drawMinimap(d);
-}
-
-function drawMinimap(d) {
- const c=$("minimap"),ctx=c.getContext("2d");
- ctx.clearRect(0,0,c.width,c.height);
- ctx.fillStyle="#0b191c";ctx.fillRect(0,0,c.width,c.height);
- const scale=1.8,center=90;
- ctx.strokeStyle="#344c4b";ctx.lineWidth=2;
- for(let i=0;i<OBSTACLE_DATA.length;i++){
-  const o=OBSTACLE_DATA[i];ctx.fillStyle="#425451";
-  ctx.fillRect(center+o[0]*scale-o[2]*scale,center+o[1]*scale-o[3]*scale,o[2]*2*scale,o[3]*2*scale);
- }
- ctx.beginPath();ctx.arc(center,center,6,0,Math.PI*2);ctx.strokeStyle="#c7f36b";ctx.stroke();
- d.players.forEach(p=>{
-  if(!p.connected)return;
-  ctx.beginPath();ctx.arc(center+p.x*scale,center+p.z*scale,4.5,0,Math.PI*2);
-  ctx.fillStyle=p.slot===playerSlot?"#c7f36b":["#65d8ce","#f2c96c","#e77b7b"][p.slot];ctx.fill();
- });
-}
-const OBSTACLE_DATA=[
- [-8,-7,3.5,1], [8,-8,3,1],[-13,3,1,4],[13,4,1,4],
- [-5,12,3,1],[6,12,3.2,1],[0,-16,5,1],[-19,-12,1,3],
- [19,14,1,4],[0,20,7,1],[-22,0,1,5],[22,-3,1,5],[-3,2,1,2],[4,-2,1,2]
-];
-
-// ============================================================
-// Three.js: خريطة مولدة برمجياً ونماذج خفيفة
-// ============================================================
-
-function ensureRenderer() {
- if(renderer)return;
- try {
-  renderer=new THREE.WebGLRenderer({canvas:$("world"),antialias:localSettings.quality!=="low",alpha:false,powerPreference:"high-performance"});
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,localSettings.quality==="high"?1.6:1.15));
-  renderer.setSize(innerWidth,innerHeight);
-  renderer.shadowMap.enabled=localSettings.quality==="high";
-  renderer.shadowMap.type=THREE.PCFSoftShadowMap;
-  renderer.outputColorSpace=THREE.SRGBColorSpace;
-  scene=new THREE.Scene();
-  scene.background=new THREE.Color(0x101b20);
-  scene.fog=new THREE.FogExp2(0x101b20,0.012);
-  camera=new THREE.PerspectiveCamera(72,innerWidth/innerHeight,0.1,180);
-  camera.position.set(0,4,8);
-  buildWorld();
-  animate(performance.now());
- } catch(err) {
-  toast("تعذر تشغيل WebGL على هذا الجهاز",true);
- }
-}
-
-function mat(color,roughness=0.9,metalness=0.05) {
- return new THREE.MeshStandardMaterial({color,roughness,metalness});
-}
-function addBox(x,y,z,sx,sy,sz,material,cast=true) {
- const mesh=new THREE.Mesh(new THREE.BoxGeometry(sx,sy,sz),material);
- mesh.position.set(x,y,z);mesh.castShadow=cast;mesh.receiveShadow=true;scene.add(mesh);return mesh;
-}
-function buildWorld() {
- const hemi=new THREE.HemisphereLight(0xa9d5cf,0x202a25,2.0);scene.add(hemi);
- const sun=new THREE.DirectionalLight(0xffe3b4,2.1);sun.position.set(-18,30,12);
- sun.castShadow=localSettings.quality==="high";sun.shadow.mapSize.set(1024,1024);scene.add(sun);
- const ground=addBox(0,-0.3,0,100,0.6,100,mat(0x39453c),false);
- const grid=new THREE.GridHelper(90,45,0x64756a,0x4c5c51);grid.position.y=0.015;scene.add(grid);
-
- // ممرات ومناطق ترابية بألوان مختلفة.
- addBox(0,0.015,0,5,0.03,100,mat(0x51544a),false);
- addBox(0,0.02,0,100,0.03,4,mat(0x51544a),false);
- addBox(0,0.03,0,5,0.03,5,mat(0x6b7448),false);
-
- OBSTACLE_DATA.forEach((o,i)=>{
-  const colors=[0x515d56,0x454f4b,0x59635a,0x404c4a];
-  const h=[2.7,2.4,3.2,3.0][i%4];
-  addBox(o[0],h/2,o[1],o[2]*2,h,o[3]*2,mat(colors[i%colors.length]),true);
-  if(i%3===0){
-   addBox(o[0],h+0.08,o[1],o[2]*1.55,0.16,o[3]*1.55,mat(0x77775c),false);
-  }
- });
- // حاويات عسكرية منخفضة.
- for(let i=0;i<7;i++){
-  const x=-24+i*8;
-  if(Math.abs(x)<8)continue;
-  addBox(x,0.8,7,3.2,1.6,1.4,mat(i%2?0x394b48:0x59604b));
-  for(let j=0;j<4;j++)addBox(x-1.1+j*.7,1.65,7,0.08,.05,1.42,mat(0x7c8b76),false);
- }
- // نقطة السيطرة: حلقة مرئية.
- const ring=new THREE.Mesh(new THREE.TorusGeometry(3,0.08,8,48),new THREE.MeshBasicMaterial({color:0xc7f36b}));
- ring.rotation.x=Math.PI/2;ring.position.set(0,0.08,0);scene.add(ring);
- const pole=addBox(0,1.4,0,.12,2.8,.12,mat(0xb3c4ad),false);
- const flag=addBox(0.55,2.25,0,1.1,.55,.06,mat(0xc7f36b),false);
- // صخور زخرفية ثابتة.
- for(let i=0;i<22;i++){
-  const x=((i*17)%79)-39,z=((i*29)%79)-39;
-  if(Math.abs(x)<8&&Math.abs(z)<8)continue;
-  const rock=new THREE.Mesh(new THREE.DodecahedronGeometry(.45+(i%4)*.16,0),mat(i%2?0x515b51:0x3d4844));
-  rock.position.set(x,.35,z);rock.scale.y=.65;rock.castShadow=true;scene.add(rock);
- }
- // سماء صناعية وأعمدة ضوء بعيدة.
- const horizon=addBox(0,2,-49,100,4,1,mat(0x243237),false);
- for(let i=0;i<16;i++){
-  const x=-38+i*5;
-  addBox(x,2.5,-35-(i%3)*2,.28,5,.28,mat(0x53645a),false);
- }
-}
-
-function createSoldier(slot) {
- const group=new THREE.Group();
- const color=[0x8da78d,0x6eaaa4,0xbba16a][slot]||0x8da78d;
- const bodyMat=mat(color), dark=mat(0x202a2c), armor=mat(0x45554b), skin=mat(0xc4a889);
- const torso=new THREE.Mesh(new THREE.BoxGeometry(.72,.8,.4),bodyMat);torso.position.y=1.12;torso.castShadow=true;group.add(torso);
- const vest=new THREE.Mesh(new THREE.BoxGeometry(.76,.48,.43),armor);vest.position.set(0,1.16,-.02);group.add(vest);
- const head=new THREE.Mesh(new THREE.SphereGeometry(.22,10,8),skin);head.position.y=1.72;head.castShadow=true;group.add(head);
- const helmet=new THREE.Mesh(new THREE.SphereGeometry(.245,10,6,0,Math.PI*2,0,Math.PI/2),dark);helmet.position.y=1.82;group.add(helmet);
- for(const side of [-1,1]){
-  const leg=new THREE.Mesh(new THREE.BoxGeometry(.23,.65,.25),dark);leg.position.set(side*.2,.38,0);leg.castShadow=true;group.add(leg);
-  const arm=new THREE.Mesh(new THREE.BoxGeometry(.2,.62,.23),bodyMat);arm.position.set(side*.46,1.12,-.02);group.add(arm);
- }
- // سلاح مرئي في الأمام.
- const gun=new THREE.Group();
- const barrel=new THREE.Mesh(new THREE.BoxGeometry(.13,.13,.85),dark);barrel.position.z=-.47;gun.add(barrel);
- const grip=new THREE.Mesh(new THREE.BoxGeometry(.12,.24,.16),dark);grip.position.set(0,-.15,-.2);gun.add(grip);
- gun.position.set(.34,1.18,-.25);group.add(gun);
- group.userData.gun=gun;group.userData.body=torso;
- scene.add(group);localMeshes.set(slot,group);return group;
-}
-
-function syncMeshes(d,dt) {
- const seen=new Set();
- d.players.forEach(p=>{
-  if(!p.connected){const old=localMeshes.get(p.slot);if(old){scene.remove(old);localMeshes.delete(p.slot);}return;}
-  seen.add(p.slot);
-  let mesh=localMeshes.get(p.slot);
-  if(!mesh)mesh=createSoldier(p.slot);
-  mesh.visible=p.alive;
-  const target=new THREE.Vector3(p.x,p.y,p.z);
-  mesh.position.lerp(target,Math.min(1,dt*12));
-  mesh.rotation.y=p.yaw;
-  if(mesh.userData.body)mesh.userData.body.scale.y=p.crouch?.72:1;
-  if(mesh.userData.gun)mesh.userData.gun.rotation.x=-p.pitch;
- });
- for(const [slot,mesh] of localMeshes){
-  if(!seen.has(slot)){scene.remove(mesh);localMeshes.delete(slot);}
- }
- const me=d.players.find(p=>p.slot===playerSlot);
- if(me){
-  const eyeY=me.y+(me.crouch?1.2:1.58);
-  cameraYaw=me.yaw;
-  const desired=new THREE.Vector3(
-   me.x+Math.sin(cameraYaw)*4.2,
-   eyeY+2.1-cameraPitch*2,
-   me.z+Math.cos(cameraYaw)*4.2
-  );
-  camera.position.lerp(desired,Math.min(1,dt*8));
-  const target=new THREE.Vector3(
-   me.x-Math.sin(cameraYaw)*5,
-   eyeY+cameraPitch*7,
-   me.z-Math.cos(cameraYaw)*5
-  );
-  camera.lookAt(target);
- }
-}
-
-function spawnTracer(d) {
- if(!scene)return;
- const start=new THREE.Vector3(d.x,d.y,d.z);
- const end=new THREE.Vector3(d.x+d.dx*d.distance,d.y+d.dy*d.distance,d.z+d.dz*d.distance);
- const geometry=new THREE.BufferGeometry().setFromPoints([start,end]);
- const line=new THREE.Line(geometry,new THREE.LineBasicMaterial({color:d.hit!==null?0xffb66d:0xd9e6c7,transparent:true,opacity:.9}));
- scene.add(line);effects.push({obj:line,until:performance.now()+110});
- const flash=new THREE.Mesh(new THREE.SphereGeometry(.09,6,5),new THREE.MeshBasicMaterial({color:0xffd38c}));
- flash.position.copy(start);scene.add(flash);effects.push({obj:flash,until:performance.now()+75});
-}
-function spawnExplosion(x,z) {
- if(!scene)return;
- const mesh=new THREE.Mesh(new THREE.SphereGeometry(.5,10,8),new THREE.MeshBasicMaterial({color:0xff7b39,transparent:true,opacity:.75}));
- mesh.position.set(x,.8,z);scene.add(mesh);effects.push({obj:mesh,until:performance.now()+450,explode:true});
- playTone(65,.18,"sawtooth",.08);
-}
-function animate(ts) {
- requestAnimationFrame(animate);
- if(!renderer||!scene||!camera)return;
- const dt=Math.min(.05,(ts-lastFrame)/1000);lastFrame=ts;
- if(inGame&&latestSnapshot)syncMeshes(latestSnapshot,dt);
- for(let i=effects.length-1;i>=0;i--){
-  const e=effects[i];
-  if(e.explode){e.obj.scale.multiplyScalar(1+dt*5);e.obj.material.opacity=Math.max(0,e.obj.material.opacity-dt*1.8);}
-  if(ts>=e.until){scene.remove(e.obj);e.obj.geometry?.dispose();e.obj.material?.dispose();effects.splice(i,1);}
- }
- renderer.render(scene,camera);
-}
-window.addEventListener("resize",()=>{
- if(renderer&&camera){camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);}
-});
-document.addEventListener("visibilitychange",()=>{
- if(document.hidden){control.fire=false;control.moveX=0;control.moveZ=0;sendInput(true);}
-});
-
-// ============================================================
-// تحكم لمس متعدد: عصا الحركة والتصويب والأزرار المستمرة
-// ============================================================
-
-function bindStick(id,kind) {
- const el=$(id),knob=el.querySelector(".knob");
- let activeId=null,centerX=0,centerY=0,radius=45;
- function begin(e) {
-  if(activeId!==null)return;
-  e.preventDefault();activeId=e.pointerId;
-  el.setPointerCapture?.(e.pointerId);
-  const r=el.getBoundingClientRect();centerX=r.left+r.width/2;centerY=r.top+r.height/2;radius=r.width*.34;
-  update(e);
- }
- function update(e) {
-  if(e.pointerId!==activeId)return;
-  const dx=e.clientX-centerX,dy=e.clientY-centerY;
-  const length=Math.hypot(dx,dy),scale=length>radius?radius/length:1;
-  const nx=dx*scale,ny=dy*scale;
-  knob.style.left=`calc(50% + ${nx}px)`;knob.style.top=`calc(50% + ${ny}px)`;
-  if(kind==="move"){control.moveX=nx/radius;control.moveZ=-ny/radius;}
-  else {
-   control.yawDelta=dx/radius*0.045*localSettings.sensitivity;
-   control.pitchDelta=(localSettings.invertY?1:-1)*(-dy/radius)*0.035*localSettings.sensitivity;
-  }
- }
- function end(e) {
-  if(e.pointerId!==activeId)return;
-  activeId=null;knob.style.left="50%";knob.style.top="50%";
-  if(kind==="move"){control.moveX=0;control.moveZ=0;}
-  else {control.yawDelta=0;control.pitchDelta=0;}
- }
- el.addEventListener("pointerdown",begin);
- el.addEventListener("pointermove",update);
- el.addEventListener("pointerup",end);
- el.addEventListener("pointercancel",end);
- el.addEventListener("lostpointercapture",end);
-}
-bindStick("moveStick","move");
-bindStick("lookStick","look");
-
-function holdButton(id,onStart,onEnd=()=>{}) {
- const el=$(id);let pointers=new Set();
- el.addEventListener("pointerdown",e=>{
-  e.preventDefault();pointers.add(e.pointerId);el.setPointerCapture?.(e.pointerId);onStart();
- });
- const end=e=>{if(!pointers.has(e.pointerId))return;pointers.delete(e.pointerId);if(!pointers.size)onEnd();};
- el.addEventListener("pointerup",end);el.addEventListener("pointercancel",end);
- el.addEventListener("lostpointercapture",end);
-}
-holdButton("fireBtn",()=>control.fire=true,()=>control.fire=false);
-holdButton("aimBtn",()=>control.aim=true,()=>control.aim=false);
-holdButton("sprintBtn",()=>control.sprint=true,()=>control.sprint=false);
-holdButton("crouchBtn",()=>control.crouch=true,()=>control.crouch=false);
-holdButton("jumpBtn",()=>{control.jump=true;sendInput(true);control.jump=false;});
-holdButton("reloadBtn",()=>{control.reload=true;sendInput(true);control.reload=false;});
-holdButton("grenadeBtn",()=>{control.grenade=true;sendInput(true);control.grenade=false;});
-holdButton("interactBtn",()=>{control.interact=true;sendInput(true);control.interact=false;});
-holdButton("switchBtn",()=>{control.switchWeapon=true;sendInput(true);control.switchWeapon=false;});
-
-function sendInput(force=false) {
- if(!socket.connected||!roomId||!role)return;
- const t=performance.now();
- if(!force&&t-lastInputSend<45)return;
- lastInputSend=t;
- const payload={
-  room_id:roomId,seq:++inputSeq,
-  move_x:control.moveX,move_z:control.moveZ,
-  yaw_delta:control.yawDelta,pitch_delta:control.pitchDelta,
-  fire:control.fire,aim:control.aim,sprint:control.sprint,crouch:control.crouch,
-  jump:control.jump,reload:control.reload,grenade:control.grenade,
-  interact:control.interact,switch_weapon:control.switchWeapon
- };
- socket.emit("input",payload);
- // استهلاك نبضات الإجراءات مرة واحدة فقط.
- control.yawDelta=0;control.pitchDelta=0;
- control.jump=false;control.reload=false;control.grenade=false;
- control.interact=false;control.switchWeapon=false;
-}
-setInterval(()=>{if(inGame)sendInput();},50);
-window.addEventListener("pointerup",()=>{if(!inGame)return;sendInput(true);});
-window.addEventListener("blur",()=>{
- control.fire=false;control.moveX=0;control.moveZ=0;
- control.aim=false;control.sprint=false;control.crouch=false;sendInput(true);
-});
-window.addEventListener("pagehide",()=>{
- control.fire=false;control.moveX=0;control.moveZ=0;sendInput(true);
-});
-
-function loadSettings() {
- try {
-  const s=JSON.parse(localStorage.getItem("asadFrontlineSettings")||"{}");
-  localSettings={...localSettings,...s};
- } catch(e){}
- $("sensRange").value=localSettings.sensitivity;
- $("sizeRange").value=localSettings.size;
- $("opacityRange").value=localSettings.opacity;
- $("qualitySelect").value=localSettings.quality;
- $("invertY").checked=localSettings.invertY;
- $("soundToggle").checked=localSettings.sound;
- updateSettingLabels();
-}
-function saveSettings() {
- try{localStorage.setItem("asadFrontlineSettings",JSON.stringify(localSettings));}catch(e){}
- applySettings();
-}
-function updateSettingLabels() {
- $("sensLabel").textContent=Number(localSettings.sensitivity).toFixed(1);
- $("sizeLabel").textContent=localSettings.size+"%";
- $("opacityLabel").textContent=localSettings.opacity+"%";
-}
-function applySettings() {
- document.querySelectorAll(".action,.stick").forEach(el=>{
-  el.style.opacity=localSettings.opacity/100;
-  el.style.scale=String(localSettings.size/100);
- });
- if(renderer){
-  renderer.setPixelRatio(Math.min(devicePixelRatio||1,localSettings.quality==="high"?1.6:localSettings.quality==="medium"?1.15:.8));
-  renderer.shadowMap.enabled=localSettings.quality==="high";
- }
-}
-["sensRange","sizeRange","opacityRange","qualitySelect","invertY","soundToggle"].forEach(id=>{
- $(id).addEventListener("input",()=>{
-  localSettings.sensitivity=+$("sensRange").value;
-  localSettings.size=+$("sizeRange").value;
-  localSettings.opacity=+$("opacityRange").value;
-  localSettings.quality=$("qualitySelect").value;
-  localSettings.invertY=$("invertY").checked;
-  localSettings.sound=$("soundToggle").checked;
-  updateSettingLabels();saveSettings();
- });
-});
-loadSettings();
-
-function playTone(freq,duration,type="sine",volume=.05) {
- if(!localSettings.sound)return;
- try {
-  audioContext=audioContext||new (window.AudioContext||window.webkitAudioContext)();
-  if(audioContext.state==="suspended")audioContext.resume();
-  const osc=audioContext.createOscillator(),gain=audioContext.createGain();
-  osc.type=type;osc.frequency.value=freq;
-  gain.gain.setValueAtTime(volume,audioContext.currentTime);
-  gain.gain.exponentialRampToValueAtTime(.001,audioContext.currentTime+duration);
-  osc.connect(gain);gain.connect(audioContext.destination);osc.start();osc.stop(audioContext.currentTime+duration);
- }catch(e){}
-}
-document.body.addEventListener("pointerdown",()=>{if(localSettings.sound)playTone(320,.025,"sine",.001);},{once:true});
-
-socket.on("connect",()=>{if(role==="controller"&&roomId){/* لا تُعاد المصادقة تلقائياً برمز مستخدم */}});
-window.addEventListener("contextmenu",e=>e.preventDefault());
-document.addEventListener("selectstart",e=>e.preventDefault());
-
-})();
-</script>
-</body>
-</html>
-"""
-
-
-# ============================================================
-# 4. مسارات HTTP
-# ============================================================
-
-@app.get("/")
-def index():
-    return render_template_string(PAGE)
-
-
-@app.get("/health")
-def health():
-    with world_lock:
-        return jsonify({
-            "status": "ok",
-            "game": GAME_NAME,
-            "rooms_in_memory": len(rooms),
-            "time": int(now()),
-        }), 200
-
-
-@app.get("/api/status")
-def api_status():
-    with world_lock:
-        return jsonify({
-            "game": GAME_NAME,
-            "developer": DEVELOPER,
-            "active_rooms": len(rooms),
-            "transport": "Socket.IO",
-        })
-
-
-# ============================================================
-# 5. أحداث Socket.IO وصلاحيات الغرف
-# ============================================================
-
-@socketio.on("connect")
-def on_connect(auth=None):
-    start_engine_once()
-    emit("server_ready", {"ok": True, "game": GAME_NAME})
-
-
-@socketio.on("disconnect")
-def on_disconnect(reason=None):
-    with world_lock:
-        info = sid_index.pop(request.sid, None)
-        rate_limits.pop((request.sid, "input"), None)
-        if not info:
-            return
-        room_id, slot = info
-        room = rooms.get(room_id)
-        if not room:
-            return
-        p = room["players"].get(request.sid)
-        if p:
-            p["connected"] = False
-            p["sid"] = None
-            p["fire"] = False
-            p["move_x"] = 0.0
-            p["move_z"] = 0.0
-            p["sprint"] = False
-            p["aim"] = False
-            p["last_input"] = 0.0
-        # يحتفظ المقعد بهويته حتى انتهاء الغرفة؛ لا يُسند تلقائياً لجهاز غريب.
-        room["last_active"] = now()
-        update_room_status(room)
-
-
-def fail(message):
-    return {"ok": False, "error": message}
-
-
-@socketio.on("create_room")
-def on_create_room(data):
-    data = data if isinstance(data, dict) else {}
-    with world_lock:
-        if request.sid in sid_index:
-            return fail("هذا الاتصال مرتبط بغرفة بالفعل.")
-        name = clean_name(data.get("name"), "ASAD_BATTLE")
-        player_name = clean_name(data.get("player_name"), "ASAD")
+        c = "".join(secrets.choice(ALPHA) for _ in range(6))
+        if c not in CODES: return c
+
+def new_player(i):
+    x, y = SPAWNS[i]
+    return dict(x=x, y=y, vx=0.0, vy=0.0, aim=0.0, hp=100, ammo=MAG, res=RESERVE, inp={},
+                last=0.0, rel=0.0, dead=0.0, alive=True, score=0.0, kills=0, deaths=0, act=False)
+
+def reset_player(i, p):
+    p.update(new_player(i)); p["act"] = True
+
+def make_room(name):
+    rid = secrets.token_hex(8)
+    r = dict(id=rid, name=name, codes=[new_code() for _ in range(3)], created=time.time(), st="lobby",
+             players=[new_player(i) for i in range(3)], ws=[None]*3, conn=[False]*3, bullets=[],
+             t_end=0, cd_end=0, ev=[], win=-1, empty_since=time.time(), msgs=[[0,0]]*3)
+    for i, c in enumerate(r["codes"]): CODES[c] = (rid, i)
+    ROOMS[rid] = r
+    return r
+
+def drop_room(r):
+    for c in r["codes"]: CODES.pop(c, None)
+    ROOMS.pop(r["id"], None)
+    for w in r["ws"]:
         try:
-            room = new_room(name, request.sid)
-        except Exception:
-            return fail("تعذر إنشاء الغرفة. حاول مرة أخرى.")
-        p = room["players"][request.sid]
-        p["name"] = player_name
-        join_room(room["id"])
-        room["last_active"] = now()
-        update_room_status(room)
-        return {
-            "ok": True,
-            "room": public_room(room),
-            "codes": dict(room["codes"]),
-        }
+            if w: w.close()
+        except Exception: pass
 
+def hit_wall(x, y, rad):
+    for a, b, w, h in WALLS:
+        cx, cy = min(max(x, a), a + w), min(max(y, b), b + h)
+        if (x-cx)**2 + (y-cy)**2 < rad*rad: return True
+    return x < rad or y < rad or x > W-rad or y > H-rad
 
-@socketio.on("join_controller")
-def on_join_controller(data):
-    data = data if isinstance(data, dict) else {}
-    code = str(data.get("code", "")).strip().upper()
-    name = clean_name(data.get("name"), "SOLDIER")
-    if not re.fullmatch(r"[A-HJ-NP-Z2-9]{8}", code):
-        return fail("صيغة الرمز غير صحيحة.")
-    with world_lock:
-        if request.sid in sid_index:
-            return fail("هذا الاتصال مرتبط بغرفة بالفعل.")
-        found = None
-        slot = None
-        for room in rooms.values():
-            for role_name, expected in room["codes"].items():
-                if secrets.compare_digest(code, expected):
-                    found = room
-                    slot = {"host": 0, "controller1": 1, "controller2": 2}[role_name]
+def step(r, now, dt):
+    r["ev"] = []
+    if r["st"] == "countdown" and now >= r["cd_end"]:
+        r["st"] = "playing"; r["t_end"] = now + MATCH_SECONDS
+    if r["st"] != "playing": return
+    P = r["players"]
+    for i, p in enumerate(P):
+        if not p["act"]: continue
+        if not p["alive"]:
+            if now >= p["dead"]:
+                sx, sy = SPAWNS[i]; p.update(x=sx, y=sy, hp=100, ammo=MAG, res=RESERVE, alive=True, rel=0.0)
+            continue
+        inp = p["inp"] if r["conn"][i] else {}
+        mx, my = inp.get("mx", 0), inp.get("my", 0)
+        m = math.hypot(mx, my)
+        if m > 1: mx, my = mx/m, my/m
+        spd = 210 * (1.55 if inp.get("sp") and m > .3 else 1.0)      # سرعة المشي / الركض
+        k = min(1, dt * 9)                                            # تسارع وتباطؤ
+        p["vx"] += (mx*spd - p["vx"]) * k; p["vy"] += (my*spd - p["vy"]) * k
+        nx = p["x"] + p["vx"]*dt
+        if hit_wall(nx, p["y"], RADIUS): p["vx"] = 0
+        else: p["x"] = nx
+        ny = p["y"] + p["vy"]*dt
+        if hit_wall(p["x"], ny, RADIUS): p["vy"] = 0
+        else: p["y"] = ny
+        ax, ay = inp.get("ax", 0), inp.get("ay", 0)
+        if math.hypot(ax, ay) > .2: p["aim"] = math.atan2(ay, ax)
+        if p["rel"] and now >= p["rel"]:                              # انتهاء إعادة التلقيم
+            take = min(MAG - p["ammo"], p["res"]); p["ammo"] += take; p["res"] -= take; p["rel"] = 0.0
+        if not p["rel"] and p["res"] > 0 and p["ammo"] < MAG and (inp.get("rl") or p["ammo"] == 0):
+            p["rel"] = now + 1.6; r["ev"].append(["rl", i])
+        if inp.get("fire") and not p["rel"] and p["ammo"] > 0 and now - p["last"] >= 0.11:
+            p["last"] = now; p["ammo"] -= 1
+            a = p["aim"] + random.uniform(-.045, .045) - (0.02 if inp.get("sp") else 0)  # انتشار الطلقات
+            r["bullets"].append([p["x"], p["y"], math.cos(a)*760, math.sin(a)*760, 1.2, i, 0.0])
+            r["ev"].append(["sh", i])
+    for b in r["bullets"][:]:                                         # حركة الطلقات والإصابات
+        dead = False
+        for _ in range(3):
+            d = dt / 3
+            b[0] += b[2]*d; b[1] += b[3]*d; b[4] -= d; b[6] += 760*d
+            if b[4] <= 0 or hit_wall(b[0], b[1], 1): dead = True; break
+            for j, q in enumerate(P):
+                if j == b[5] or not q["act"] or not q["alive"] or not r["conn"][j]: continue
+                if (q["x"]-b[0])**2 + (q["y"]-b[1])**2 < (RADIUS+2)**2:
+                    q["hp"] -= max(10, 26 - b[6]/60)                  # الضرر يقل مع المسافة
+                    r["ev"].append(["hit", j]); dead = True
+                    if q["hp"] <= 0:
+                        q["alive"] = False; q["dead"] = now + 3; q["deaths"] += 1
+                        P[b[5]]["kills"] += 1; P[b[5]]["score"] += 10
+                        r["ev"].append(["kill", b[5], j])
                     break
-            if found:
-                break
+            if dead: break
+        if dead: r["bullets"].remove(b)
+    inside = [i for i, p in enumerate(P) if p["act"] and p["alive"] and (p["x"]-ZONE[0])**2 + (p["y"]-ZONE[1])**2 < ZONE[2]**2]
+    r["zone"] = inside[0] if len(inside) == 1 else (-2 if inside else -1)   # -2 متنازع عليها
+    if len(inside) == 1: P[inside[0]]["score"] += dt                        # نقطة لكل ثانية سيطرة
+    if now >= r["t_end"]:
+        r["st"] = "ended"; r["bullets"] = []
+        act = [i for i, p in enumerate(P) if p["act"]]
+        r["win"] = max(act, key=lambda i: P[i]["score"]) if act else -1
 
-        if not found:
-            return fail("الرمز غير صحيح أو انتهت صلاحيته أو الغرفة غير موجودة.")
-        room = found
-        if now() - room["created"] > TOKEN_TTL:
-            return fail("انتهت صلاحية الرمز. اطلب من المضيف تجديد الرموز.")
-        if slot == 0:
-            return fail("هذا رمز الجهاز الأساسي، وليس رمز وحدة تحكم.")
-        if room["state"] in ("results", "closed"):
-            return fail("الغرفة لا تقبل اتصالات جديدة في هذه الحالة.")
-        if slot in room["used_codes"]:
-            return fail("وحدة التحكم مستخدمة بالفعل. اطلب من المضيف تجديد الرموز.")
-        if room["slots"][slot] is not None:
-            return fail("مقعد وحدة التحكم محجوز بالفعل.")
-        if sum(1 for s in room["slots"] if s is not None) >= MAX_PLAYERS:
-            return fail("الغرفة ممتلئة. الحد الأقصى ثلاثة أجهزة.")
+def snapshot(r, now):
+    P = r["players"]
+    return json.dumps(dict(t="s", st=r["st"], name=r["name"], win=r["win"], zone=r.get("zone", -1),
+        left=max(0, round(r["t_end"]-now)) if r["st"] == "playing" else MATCH_SECONDS,
+        cd=max(1, math.ceil(r["cd_end"]-now)) if r["st"] == "countdown" else 0,
+        p=[[round(p["x"]), round(p["y"]), round(p["aim"], 2), max(0, round(p["hp"])), p["ammo"], p["res"],
+            int(p["score"]), p["kills"], p["deaths"], int(p["alive"]), int(r["conn"][i]), int(p["rel"] > 0), int(p["act"])]
+           for i, p in enumerate(P)],
+        b=[[round(b[0]), round(b[1])] for b in r["bullets"]], ev=r["ev"]))
 
-        p = fresh_player(slot, name, request.sid)
-        room["slots"][slot] = request.sid
-        room["players"][request.sid] = p
-        room["used_codes"].add(slot)
-        sid_index[request.sid] = (room["id"], slot)
-        room["last_active"] = now()
-        join_room(room["id"])
-        update_room_status(room)
-        return {
-            "ok": True,
-            "room": public_room(room),
-            "slot": slot,
-            "message": "تم الاتصال بنجاح",
-        }
+def broadcast(r, now):
+    msg = snapshot(r, now)
+    for i, w in enumerate(r["ws"]):
+        if w and r["conn"][i]:
+            try: w.send(msg)
+            except Exception: r["conn"][i] = False; r["players"][i]["inp"] = {}
 
+def game_loop():
+    last = time.time()
+    while True:
+        time.sleep(0.05)
+        now = time.time(); dt = min(0.1, now - last); last = now
+        with LOCK:
+            for r in list(ROOMS.values()):
+                try:
+                    step(r, now, dt); broadcast(r, now)
+                    if any(r["conn"]): r["empty_since"] = now
+                    if now - r["created"] > CODE_TTL or now - r["empty_since"] > 900: drop_room(r)
+                except Exception as e: print("loop error:", repr(e))
+            for k in [k for k, v in RATE.items() if now - v[0] > 60]: RATE.pop(k, None)
 
-@socketio.on("start_match")
-def on_start_match(data):
-    data = data if isinstance(data, dict) else {}
-    with world_lock:
-        info = sid_index.get(request.sid)
-        if not info or info[1] != 0:
-            return fail("بدء المباراة متاح للمضيف فقط.")
-        room = rooms.get(info[0])
-        if not room or room["host_sid"] != request.sid:
-            return fail("صلاحية المضيف غير صالحة.")
-        ok, message = start_match(room)
-        if not ok:
-            return fail(message)
-        room_emit(room, "match_started", {"ok": True})
-        return {"ok": True, "message": message}
+threading.Thread(target=game_loop, daemon=True).start()
 
+# ---------- القسم 3: مسارات HTTP ----------
+@app.route("/health")
+def health():
+    with LOCK: return jsonify(ok=True, rooms=len(ROOMS))
 
-@socketio.on("enter_game")
-def on_enter_game(data):
-    data = data if isinstance(data, dict) else {}
-    with world_lock:
-        info = sid_index.get(request.sid)
-        if not info or info[1] != 0:
-            return fail("هذه العملية متاحة للمضيف فقط.")
-        room = rooms.get(info[0])
-        if not room or room["host_sid"] != request.sid:
-            return fail("الغرفة غير موجودة أو انتهت الجلسة.")
-        return {"ok": True, "room": public_room(room)}
+@app.route("/api/create", methods=["POST"])
+def api_create():
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "x").split(",")[0].strip()
+    now = time.time(); t0, n = RATE.get(ip, (now, 0))
+    if now - t0 > 60: t0, n = now, 0
+    RATE[ip] = (t0, n + 1)
+    if n >= 8: return jsonify(error="محاولات كثيرة، انتظر دقيقة"), 429
+    d = request.get_json(silent=True) or {}
+    name = re.sub(r"[<>&\"'\\]", "", str(d.get("name", "")))[:24].strip() or "ASAD_BATTLE"
+    with LOCK:
+        if len(ROOMS) >= 60: return jsonify(error="السيرفر ممتلئ حالياً"), 503
+        r = make_room(name)
+        return jsonify(name=r["name"], codes=r["codes"])
 
+@app.route("/")
+def index():
+    return Response(PAGE.replace("__GAME__", GAME_NAME).replace("__DEV__", DEV_NAME), mimetype="text/html")
 
-@socketio.on("rotate_codes")
-def on_rotate_codes(data):
-    with world_lock:
-        info = sid_index.get(request.sid)
-        if not info or info[1] != 0:
-            return fail("تجديد الرموز متاح للمضيف فقط.")
-        room = rooms.get(info[0])
-        if not room or room["host_sid"] != request.sid:
-            return fail("صلاحية المضيف غير صالحة.")
+# ---------- القسم 4: WebSocket ----------
+def num(v):
+    try:
+        v = float(v)
+        return 0.0 if v != v else max(-1.0, min(1.0, v))
+    except Exception: return 0.0
 
-        # فصل وحدات التحكم القديمة وإبطال رموزها.
-        for slot in (1, 2):
-            old_sid = room["slots"][slot]
-            if old_sid:
-                old = room["players"].get(old_sid)
-                if old:
-                    old["connected"] = False
-                    old["sid"] = None
-                sid_index.pop(old_sid, None)
-                room["slots"][slot] = None
-        room["codes"] = {
-            "host": make_unique_code(),
-            "controller1": make_unique_code(),
-            "controller2": make_unique_code(),
-        }
-        room["used_codes"].clear()
-        room["last_active"] = now()
-        update_room_status(room)
-        return {
-            "ok": True,
-            "codes": dict(room["codes"]),
-            "room": public_room(room),
-        }
+@sock.route("/ws")
+def ws_handler(ws):
+    rid = slot = None
+    try:
+        while True:
+            raw = ws.receive(timeout=40)
+            if raw is None: continue
+            if len(raw) > 400: continue
+            try: m = json.loads(raw)
+            except Exception: continue
+            if not isinstance(m, dict): continue
+            t = m.get("t")
+            with LOCK:
+                if rid is None:                                         # لا شيء قبل التحقق من الرمز
+                    if t != "join": continue
+                    code = str(m.get("code", "")).strip().upper()[:8]
+                    hit = CODES.get(code)
+                    if not hit: ws.send(json.dumps(dict(t="err", m="الرمز غير صحيح أو منتهي الصلاحية"))); continue
+                    r = ROOMS.get(hit[0])
+                    if not r: ws.send(json.dumps(dict(t="err", m="الغرفة غير موجودة"))); continue
+                    if r["conn"][hit[1]]: ws.send(json.dumps(dict(t="err", m="هذا الرمز مستخدم بالفعل من جهاز متصل"))); continue
+                    rid, slot = hit
+                    r["ws"][slot] = ws; r["conn"][slot] = True
+                    if r["st"] == "playing": reset_player(slot, r["players"][slot]) if not r["players"][slot]["act"] else None
+                    ws.send(json.dumps(dict(t="joined", slot=slot, name=r["name"], codes=r["codes"] if slot == 0 else None)))
+                    continue
+                r = ROOMS.get(rid)
+                if not r or r["ws"][slot] is not ws: return
+                now = time.time(); c = r["msgs"][slot]
+                if now - c[0] > 1: r["msgs"][slot] = c = [now, 0]
+                c[1] += 1
+                if c[1] > 60: continue                                   # حد معدل الرسائل
+                if t == "in":
+                    r["players"][slot]["inp"] = dict(mx=num(m.get("mx")), my=num(m.get("my")), ax=num(m.get("ax")),
+                        ay=num(m.get("ay")), fire=bool(m.get("fire")), rl=bool(m.get("rl")), sp=bool(m.get("sp")))
+                elif t == "start" and slot == 0 and r["st"] in ("lobby", "ended"):
+                    for i, p in enumerate(r["players"]):
+                        if r["conn"][i]: reset_player(i, p)
+                        else: p.update(new_player(i))
+                    r["bullets"] = []; r["win"] = -1; r["st"] = "countdown"; r["cd_end"] = now + 3
+                elif t == "lobby" and slot == 0 and r["st"] == "ended": r["st"] = "lobby"
+                elif t == "cancel" and slot == 0:
+                    msg = json.dumps(dict(t="err", m="تم إلغاء الغرفة")); 
+                    for w in r["ws"]:
+                        try:
+                            if w: w.send(msg)
+                        except Exception: pass
+                    drop_room(r); return
+    except Exception:
+        pass
+    finally:
+        with LOCK:
+            r = ROOMS.get(rid) if rid else None
+            if r and r["ws"][slot] is ws: r["conn"][slot] = False; r["players"][slot]["inp"] = {}
 
+# ---------- القسم 5: الواجهة (HTML/CSS/JS) ----------
+PAGE = r"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>__GAME__</title><style>
+:root{--bg:#0d120e;--pn:#161d17;--ln:#2c3a2e;--tx:#e3eadc;--mu:#8a9a86;--ac:#d4a33a;--ok:#4ade80;--bad:#ef5350}
+*{box-sizing:border-box;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;touch-action:none}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font-family:Tahoma,"Segoe UI",sans-serif;overflow:hidden}
+.scr{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:max(16px,env(safe-area-inset-top)) 18px 18px}
+.scr.on{display:flex}
+#bg{position:fixed;inset:0;width:100%;height:100%}
+h1{margin:0;font-size:44px;letter-spacing:1px;color:var(--ac);text-shadow:0 2px 0 #000}
+.sub{color:var(--mu);font-size:14px}
+.big{width:min(86vw,360px);padding:20px;border:2px solid var(--ln);background:rgba(22,29,23,.9);color:var(--tx);border-radius:4px;font-size:21px;font-weight:700;display:flex;align-items:center;gap:14px;transition:.15s}
+.big:active{transform:scale(.97);border-color:var(--ac);background:#202a21}
+.big svg{width:34px;height:34px;flex:none;fill:none;stroke:var(--ac);stroke-width:2}
+input{width:min(86vw,360px);padding:15px;font-size:22px;text-align:center;background:#0a0e0a;border:2px solid var(--ln);color:var(--tx);border-radius:4px;direction:ltr;letter-spacing:3px;-webkit-user-select:text;user-select:text}
+.btn{padding:13px 22px;font-size:17px;font-weight:700;border:0;border-radius:4px;background:var(--ac);color:#1a1405}
+.btn.g{background:var(--pn);color:var(--tx);border:1px solid var(--ln)}
+#err{color:var(--bad);min-height:22px;text-align:center}
+.dev{position:fixed;bottom:max(8px,env(safe-area-inset-bottom));left:0;right:0;text-align:center;color:var(--mu);font-size:13px;pointer-events:none}
+.dev b{color:var(--ac)}
+#game{display:none}#game.on{display:block}
+#cv{position:fixed;inset:0;width:100%;height:100%;background:#10160f}
+.hud{position:fixed;pointer-events:none;font-weight:700;text-shadow:0 1px 2px #000}
+#top{top:max(6px,env(safe-area-inset-top));left:0;right:0;display:flex;justify-content:center;gap:16px;font-size:16px}
+#top span{background:rgba(10,14,10,.65);padding:4px 10px;border-radius:3px}
+#st{left:12px;bottom:calc(50% + 8px);font-size:15px;line-height:1.5;text-align:left;direction:ltr;background:rgba(10,14,10,.65);padding:6px 10px;border-radius:3px}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--bad);margin:0 4px}
+.dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+#ctl{position:fixed;inset:0;pointer-events:none}
+#ctl>*{pointer-events:auto}
+.stick{position:absolute;bottom:max(24px,env(safe-area-inset-bottom));width:calc(130px*var(--sz));height:calc(130px*var(--sz));border-radius:50%;background:rgba(255,255,255,.07);border:2px solid rgba(255,255,255,.25);opacity:var(--op)}
+.stick i{position:absolute;left:50%;top:50%;width:54%;height:54%;margin:-27% 0 0 -27%;border-radius:50%;background:rgba(212,163,58,.7);border:2px solid #f3d27a}
+#sL{left:max(22px,env(safe-area-inset-left))}#sR{right:calc(max(22px,env(safe-area-inset-right)) + 105px*var(--sz))}
+.ab{position:absolute;width:calc(70px*var(--sz));height:calc(70px*var(--sz));border-radius:50%;border:2px solid rgba(255,255,255,.35);background:rgba(20,28,20,.6);color:var(--tx);font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;opacity:var(--op)}
+.ab.p{background:rgba(212,163,58,.65);border-color:#f3d27a}
+#bF{right:max(18px,env(safe-area-inset-right));bottom:calc(max(24px,env(safe-area-inset-bottom)) + 30px*var(--sz));width:calc(88px*var(--sz));height:calc(88px*var(--sz));background:rgba(239,83,80,.55);border-color:#ff9a97;font-size:16px}
+#bR{right:max(18px,env(safe-area-inset-right));bottom:calc(max(24px,env(safe-area-inset-bottom)) + 140px*var(--sz))}
+#bS{right:calc(max(18px,env(safe-area-inset-right)) + 82px*var(--sz));bottom:calc(max(24px,env(safe-area-inset-bottom)) + 120px*var(--sz))}
+#ov{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:rgba(8,12,8,.86);padding:16px;z-index:5;text-align:center}
+#ov.on{display:flex}
+.code{display:flex;align-items:center;gap:8px;background:var(--pn);border:1px solid var(--ln);padding:8px 12px;border-radius:4px;width:min(92vw,380px);justify-content:space-between}
+.code b{font-size:22px;letter-spacing:3px;direction:ltr;color:var(--ac);-webkit-user-select:text;user-select:text}
+.code small{display:block;color:var(--mu);font-size:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+#flash{position:fixed;inset:0;background:rgba(239,83,80,.35);opacity:0;pointer-events:none;transition:opacity .25s}
+#cd{position:fixed;inset:0;display:none;align-items:center;justify-content:center;font-size:110px;font-weight:900;color:var(--ac);text-shadow:0 3px 0 #000;pointer-events:none}
+#net{position:fixed;top:40px;left:0;right:0;text-align:center;background:var(--bad);color:#fff;padding:6px;display:none;z-index:9;font-weight:700}
+#set{position:fixed;top:max(6px,env(safe-area-inset-top));right:8px;z-index:6;width:38px;height:38px;border-radius:4px;background:rgba(10,14,10,.7);border:1px solid var(--ln);color:var(--tx)}
+#sp{display:none;position:fixed;inset:0;background:rgba(8,12,8,.92);z-index:8;flex-direction:column;align-items:center;justify-content:center;gap:12px}
+#sp label{display:flex;gap:10px;align-items:center;width:min(86vw,320px);justify-content:space-between}
+#sp input[type=range]{width:55%;padding:0;letter-spacing:0}
+</style></head><body>
+<canvas id="bg"></canvas>
+<div class="scr on" id="menu">
+ <h1>__GAME__</h1><div class="sub">قتال جماعي لثلاثة هواتف</div>
+ <button class="big" id="mCreate"><svg viewBox="0 0 32 32"><circle cx="16" cy="16" r="11"/><path d="M16 5v6M16 21v6M5 16h6M21 16h6"/></svg>إنشاء غرفة واللعب</button>
+ <button class="big" id="mCtl"><svg viewBox="0 0 32 32"><rect x="3" y="9" width="26" height="15" rx="7"/><path d="M10 13v7M6.5 16.5h7"/><circle cx="21" cy="14.5" r="1.4"/><circle cx="24" cy="18" r="1.4"/></svg>وحدة التحكم</button>
+ <div class="dev">تطوير <b>__DEV__</b></div>
+</div>
+<div class="scr" id="create"><h1 style="font-size:30px">إنشاء غرفة</h1>
+ <input id="rname" value="ASAD_BATTLE" maxlength="24" style="letter-spacing:1px">
+ <button class="btn" id="doCreate">إنشاء الغرفة</button><button class="btn g" data-back>رجوع</button><div class="err" id="err1" style="color:var(--bad)"></div></div>
+<div class="scr" id="join"><h1 style="font-size:30px">وحدة التحكم</h1><div class="sub">اكتب الرمز الظاهر على شاشة اللاعب الأساسي</div>
+ <input id="jcode" maxlength="8" autocapitalize="characters" autocomplete="off" placeholder="XXXXXX">
+ <button class="btn" id="doJoin">اتصال</button><button class="btn g" data-back>رجوع</button><div id="err"></div></div>
+<div id="game">
+ <canvas id="cv"></canvas>
+ <div class="hud" id="top"><span id="tTime">0:00</span><span id="tScore"></span><span id="tConn"></span></div>
+ <div class="hud" id="st"></div><div id="cd"></div><div id="flash"></div><div id="net">انقطع الاتصال - جارٍ إعادة المحاولة</div>
+ <button id="set" aria-label="الإعدادات"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg></button>
+ <div id="ctl"><div class="stick" id="sL"><i></i></div><div class="stick" id="sR"><i></i></div>
+  <div class="ab p" id="bF">نار</div><div class="ab" id="bR">تلقيم</div><div class="ab" id="bS">ركض</div></div>
+ <div id="ov"></div>
+ <div id="sp"><label>الصوت<input type="range" id="sVol" min="0" max="1" step=".05"></label>
+  <label>حجم الأزرار<input type="range" id="sSz" min=".7" max="1.4" step=".05"></label>
+  <label>الشفافية<input type="range" id="sOp" min=".3" max="1" step=".05"></label>
+  <label>الاهتزاز<input type="checkbox" id="sVib"></label><button class="btn" id="spClose">متابعة</button></div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+let ws=null,slot=-1,S=null,joined=false,code='',retry=0,closing=false,disp=[],host=false,hitT=0,aud=null;
+const NAMES=['القائد','اللاعب 2','اللاعب 3'],COL=['#d4a33a','#4aa3e0','#e0584a'];
+let cfg=Object.assign({vol:.6,sz:1,op:.8,vib:true},JSON.parse(localStorage.getItem('cfg')||'{}'));
+function applyCfg(){document.documentElement.style.setProperty('--sz',cfg.sz);document.documentElement.style.setProperty('--op',cfg.op);try{localStorage.setItem('cfg',JSON.stringify(cfg))}catch(e){}}
+applyCfg();
+['Vol','Sz','Op'].forEach(k=>{const e=$('#s'+k);e.value=cfg[k.toLowerCase()];e.oninput=()=>{cfg[k.toLowerCase()]=+e.value;applyCfg()}});
+$('#sVib').checked=cfg.vib;$('#sVib').onchange=e=>{cfg.vib=e.target.checked;applyCfg()};
+$('#set').onclick=()=>$('#sp').style.display='flex';$('#spClose').onclick=()=>$('#sp').style.display='none';
+function show(id){document.querySelectorAll('.scr').forEach(e=>e.classList.toggle('on',e.id==id));$('#game').classList.toggle('on',id=='game');$('#bg').style.display=id=='game'?'none':'block'}
+document.querySelectorAll('[data-back]').forEach(b=>b.onclick=()=>{closing=true;if(ws)ws.close();show('menu')});
+// ---- صوت (Web Audio) ----
+function au(){if(!aud){try{aud=new (window.AudioContext||window.webkitAudioContext)()}catch(e){}}if(aud&&aud.state=='suspended')aud.resume()}
+document.addEventListener('pointerdown',au);
+function snd(kind){if(!aud||!cfg.vol)return;const t=aud.currentTime,g=aud.createGain(),o=aud.createOscillator();o.connect(g);g.connect(aud.destination);
+ const v=cfg.vol*.25;let f=[440,440,.1,'sine'];
+ if(kind=='shot')f=[180,60,.09,'sawtooth'];else if(kind=='rl')f=[600,900,.12,'square'];else if(kind=='hit')f=[300,120,.15,'square'];
+ else if(kind=='ok')f=[500,900,.2,'sine'];else if(kind=='bad')f=[300,150,.3,'sawtooth'];else if(kind=='win')f=[400,1000,.5,'triangle'];
+ o.type=f[3];o.frequency.setValueAtTime(f[0],t);o.frequency.exponentialRampToValueAtTime(f[1],t+f[2]);g.gain.setValueAtTime(v,t);g.gain.exponentialRampToValueAtTime(.001,t+f[2]);o.start(t);o.stop(t+f[2]+.02)}
+// ---- شاشة البداية المتحركة ----
+(function(){const c=$('#bg'),x=c.getContext('2d');let P=[];function rs(){c.width=innerWidth;c.height=innerHeight}rs();onresize=rs;
+ for(let i=0;i<40;i++)P.push([Math.random(),Math.random(),Math.random()*1.5+.5,Math.random()*.3+.05]);
+ (function f(){if(c.style.display!='none'){const w=c.width,h=c.height,g=x.createLinearGradient(0,0,0,h);g.addColorStop(0,'#1b2a22');g.addColorStop(.6,'#2a3224');g.addColorStop(1,'#0d120e');x.fillStyle=g;x.fillRect(0,0,w,h);
+ x.fillStyle='#0f1710';x.beginPath();x.moveTo(0,h*.72);for(let i=0;i<=8;i++)x.lineTo(w*i/8,h*(.66+.07*Math.sin(i*1.7)));x.lineTo(w,h);x.lineTo(0,h);x.fill();
+ x.fillStyle='rgba(212,163,58,.35)';P.forEach(p=>{p[0]=(p[0]+p[3]*.0008)%1;x.fillRect(p[0]*w,p[1]*h,p[2],p[2])})}requestAnimationFrame(f)})()})();
+// ---- الشبكة ----
+function connect(){closing=false;const u=(location.protocol=='https:'?'wss://':'ws://')+location.host+'/ws';ws=new WebSocket(u);
+ ws.onopen=()=>{ws.send(JSON.stringify({t:'join',code}))};
+ ws.onmessage=e=>{const m=JSON.parse(e.data);
+  if(m.t=='joined'){slot=m.slot;joined=true;retry=0;host=slot==0;$('#net').style.display='none';snd('ok');show('game');$('#cv').style.display=host?'block':'none';
+   if(m.codes)window.CODES=m.codes;$('#ctl').style.display='block'}
+  else if(m.t=='err'){snd('bad');if(!joined){$('#err').textContent=m.m;$('#err1').textContent=m.m;closing=true;ws.close()}else{closing=true;joined=false;ws.close();alert(m.m);show('menu')}}
+  else if(m.t=='s'){S=m;onState()}};
+ ws.onclose=()=>{if(closing)return;if(joined){$('#net').style.display='block';resetInput();setTimeout(connect,Math.min(5000,500*++retry))}else if(!$('#err').textContent){$('#err').textContent='تعذر الوصول إلى السيرفر';}};
+ ws.onerror=()=>{}}
+$('#mCreate').onclick=()=>show('create');$('#mCtl').onclick=()=>{$('#err').textContent='';show('join')};
+$('#doCreate').onclick=async()=>{const b=$('#doCreate');b.disabled=true;$('#err1').textContent='';
+ try{const r=await fetch('/api/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('#rname').value})});const d=await r.json();
+  if(!r.ok){$('#err1').textContent=d.error||'تعذر إنشاء الغرفة'}else{window.CODES=d.codes;code=d.codes[0];connect()}}catch(e){$('#err1').textContent='تعذر الوصول إلى السيرفر'}b.disabled=false};
+$('#doJoin').onclick=()=>{code=$('#jcode').value.trim().toUpperCase();if(code.length<4){$('#err').textContent='اكتب الرمز كاملاً';return}$('#err').textContent='';joined=false;connect()};
+// ---- التحكم باللمس المتعدد ----
+const inp={mx:0,my:0,ax:0,ay:0,fire:0,rl:0,sp:0};
+function resetInput(){Object.keys(inp).forEach(k=>inp[k]=0);document.querySelectorAll('.stick i').forEach(i=>i.style.transform='')}
+function stick(el,cb){let id=null,cx=0,cy=0;const k=el.firstElementChild;
+ function mv(e){const R=el.offsetWidth*.4;let dx=(e.clientX-cx)/R,dy=(e.clientY-cy)/R;const m=Math.hypot(dx,dy);if(m>1){dx/=m;dy/=m}k.style.transform='translate('+dx*R+'px,'+dy*R+'px)';cb(m<.12?0:dx,m<.12?0:dy)}
+ el.addEventListener('pointerdown',e=>{if(id!==null)return;id=e.pointerId;try{el.setPointerCapture(id)}catch(_){}const r=el.getBoundingClientRect();cx=r.left+r.width/2;cy=r.top+r.height/2;mv(e)});
+ el.addEventListener('pointermove',e=>{if(e.pointerId==id)mv(e)});
+ const up=e=>{if(e.pointerId==id){id=null;k.style.transform='';cb(0,0)}};
+ ['pointerup','pointercancel','lostpointercapture'].forEach(n=>el.addEventListener(n,up))}
+stick($('#sL'),(x,y)=>{inp.mx=x;inp.my=y});
+stick($('#sR'),(x,y)=>{inp.ax=x;inp.ay=y});
+function btn(el,key){let id=null;el.addEventListener('pointerdown',e=>{id=e.pointerId;try{el.setPointerCapture(id)}catch(_){}inp[key]=1;if(cfg.vib&&navigator.vibrate)navigator.vibrate(8)});
+ const up=e=>{if(e.pointerId==id){id=null;inp[key]=0}};['pointerup','pointercancel','lostpointercapture'].forEach(n=>el.addEventListener(n,up))}
+btn($('#bF'),'fire');btn($('#bR'),'rl');btn($('#bS'),'sp');
+document.addEventListener('visibilitychange',()=>{if(document.hidden)resetInput()});addEventListener('blur',resetInput);
+$('#ctl').style.display='none';
+setInterval(()=>{if(ws&&ws.readyState==1&&joined){const o=Object.assign({t:'in'},inp);ws.send(JSON.stringify(o))}},33);
+setInterval(()=>{if(ws&&ws.readyState==1&&joined)ws.send('{"t":"ping"}')},8000);
+function send(o){if(ws&&ws.readyState==1)ws.send(JSON.stringify(o))}
+// ---- الحالة والواجهة ----
+function copy(t,b){(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>{b.textContent='تم'}).catch(()=>{const i=document.createElement('input');i.value=t;document.body.appendChild(i);i.select();document.execCommand('copy');i.remove();b.textContent='تم'});setTimeout(()=>b.textContent='نسخ',1200)}
+let lastSt='';
+function onState(){const ov=$('#ov'),me=S.p[slot];
+ (S.ev||[]).forEach(e=>{if(e[0]=='sh')snd('shot');else if(e[0]=='rl'&&e[1]==slot)snd('rl');else if(e[0]=='hit'&&e[1]==slot){snd('hit');hitT=performance.now();$('#flash').style.opacity=1;setTimeout(()=>$('#flash').style.opacity=0,120);if(cfg.vib&&navigator.vibrate)navigator.vibrate(40)}});
+ const m=Math.floor(S.left/60),s=S.left%60;$('#tTime').textContent=m+':'+String(s).padStart(2,'0');
+ $('#tScore').textContent=S.p.map((p,i)=>p[12]?NAMES[i]+' '+p[6]:'').filter(Boolean).join('  |  ');
+ const nc=S.p.filter(p=>p[10]).length;$('#tConn').innerHTML='متصل '+nc+'/3 <span class="dot on"></span>';
+ $('#st').innerHTML='الصحة '+me[3]+'<br>الذخيرة '+me[4]+' / '+me[5]+(me[11]?' (تلقيم)':'')+'<br>'+(me[9]?'':'تم إقصاؤك - عودة قريبة');
+ $('#cd').style.display=S.cd?'flex':'none';$('#cd').textContent=S.cd||'';
+ if(S.st=='playing'||S.st=='countdown'){ov.classList.remove('on')}
+ else{let h='';const dots=S.p.map((p,i)=>'<span class="dot '+(p[10]?'on':'')+'"></span>'+NAMES[i]).join(' &nbsp; ');
+  if(S.st=='ended'){const o=S.p.map((p,i)=>[i,p]).filter(x=>x[1][12]).sort((a,b)=>b[1][6]-a[1][6]);
+   h='<h1 style="font-size:30px">انتهت المباراة</h1><div style="font-size:20px;color:var(--ac)">الفائز: '+NAMES[S.win]+'</div>'+o.map(x=>'<div class="code"><span>'+NAMES[x[0]]+'</span><span>نقاط '+x[1][6]+' | إقصاءات '+x[1][7]+' | خسارة '+x[1][8]+'</span></div>').join('');
+   if(lastSt!='ended')snd('win')}
+  else h='<h1 style="font-size:30px">'+'<span id="rn"></span></h1><div>بانتظار اللاعبين</div><div>'+dots+'</div>';
+  if(host){h+='<div class="row">';if(S.st=='ended')h+='<button class="btn" id="bStart">إعادة المباراة</button><button class="btn g" id="bLobby">العودة إلى الغرفة</button>';
+   else h+='<button class="btn" id="bStart">بدء المباراة</button>';h+='<button class="btn g" id="bCancel">إلغاء الغرفة</button></div>';
+   if(S.st=='lobby'&&window.CODES)h+=['رمزك (القائد)','رمز وحدة التحكم الأولى','رمز وحدة التحكم الثانية'].map((l,i)=>'<div class="code"><div><small>'+l+'</small><b>'+window.CODES[i]+'</b></div><button class="btn g" data-c="'+i+'">نسخ</button></div>').join('')}
+  else h+='<div style="color:var(--ok)">تم الاتصال بنجاح - بانتظار القائد</div>';
+  if(ov.dataset.k!=S.st+nc+(S.win)+(host?1:0)){ov.dataset.k=S.st+nc+S.win+(host?1:0);ov.innerHTML=h;const rn=$('#rn');if(rn)rn.textContent=S.name;
+   const bs=$('#bStart');if(bs)bs.onclick=()=>send({t:'start'});const bl=$('#bLobby');if(bl)bl.onclick=()=>send({t:'lobby'});
+   const bc=$('#bCancel');if(bc)bc.onclick=()=>{if(confirm('إلغاء الغرفة؟')){send({t:'cancel'});closing=true;joined=false;ws.close();show('menu')}};
+   ov.querySelectorAll('[data-c]').forEach(b=>b.onclick=()=>copy(window.CODES[+b.dataset.c],b))}
+  ov.classList.add('on')}
+ lastSt=S.st}
+// ---- الرسم ----
+const cv=$('#cv'),g=cv.getContext('2d');const WALLS=__WALLS__,ZONE=__ZONE__,AW=1600,AH=1000;
+function fit(){const d=Math.min(devicePixelRatio||1,2);cv.width=innerWidth*d;cv.height=innerHeight*d}fit();onresize=fit;
+function draw(){requestAnimationFrame(draw);if(document.hidden||!S||!host||!joined)return;
+ const w=cv.width,h=cv.height,sc=Math.min(w/820,h/480);const me=disp[slot]||[800,500];
+ S.p.forEach((p,i)=>{const d=disp[i]||(disp[i]=[p[0],p[1],p[2]]);d[0]+=(p[0]-d[0])*.4;d[1]+=(p[1]-d[1])*.4;let da=p[2]-d[2];while(da>3.14)da-=6.28;while(da<-3.14)da+=6.28;d[2]+=da*.4});
+ g.setTransform(1,0,0,1,0,0);g.fillStyle='#0d120e';g.fillRect(0,0,w,h);
+ g.setTransform(sc,0,0,sc,w/2-me[0]*sc,h/2-me[1]*sc);
+ g.fillStyle='#2b3524';g.fillRect(0,0,AW,AH);g.strokeStyle='rgba(0,0,0,.12)';g.lineWidth=1;
+ for(let x=0;x<=AW;x+=100){g.beginPath();g.moveTo(x,0);g.lineTo(x,AH);g.stroke()}for(let y=0;y<=AH;y+=100){g.beginPath();g.moveTo(0,y);g.lineTo(AW,y);g.stroke()}
+ g.fillStyle='#3a3426';g.fillRect(0,470,AW,60);g.fillRect(770,0,60,AH);
+ const zc=S.zone>=0?COL[S.zone]:S.zone==-2?'#fff':'#888';g.globalAlpha=.22;g.fillStyle=zc;g.beginPath();g.arc(ZONE[0],ZONE[1],ZONE[2],0,7);g.fill();g.globalAlpha=1;g.strokeStyle=zc;g.lineWidth=3;g.setLineDash([12,8]);g.stroke();g.setLineDash([]);
+ WALLS.forEach(a=>{g.fillStyle='rgba(0,0,0,.35)';g.fillRect(a[0]+10,a[1]+12,a[2],a[3]);g.fillStyle='#4a5046';g.fillRect(a[0],a[1]-8,a[2],a[3]);g.fillStyle='#646b5d';g.fillRect(a[0],a[1]-8,a[2],5);g.strokeStyle='#22261f';g.lineWidth=2;g.strokeRect(a[0],a[1]-8,a[2],a[3])});
+ g.fillStyle='#ffd966';S.b.forEach(b=>{g.beginPath();g.arc(b[0],b[1],3.2,0,7);g.fill()});
+ S.p.forEach((p,i)=>{if(!p[12]||!p[9])return;const d=disp[i];g.globalAlpha=p[10]?1:.4;g.fillStyle='rgba(0,0,0,.35)';g.beginPath();g.ellipse(d[0]+3,d[1]+6,15,10,0,0,7);g.fill();
+  g.save();g.translate(d[0],d[1]);g.rotate(d[2]);g.fillStyle='#222';g.fillRect(8,-3,22,6);g.fillStyle=COL[i];g.beginPath();g.arc(0,0,14,0,7);g.fill();g.fillStyle='#1b1f19';g.beginPath();g.arc(2,0,7,0,7);g.fill();g.restore();
+  g.fillStyle='#000';g.fillRect(d[0]-18,d[1]-26,36,5);g.fillStyle=p[3]>40?'#4ade80':'#ef5350';g.fillRect(d[0]-17,d[1]-25,34*p[3]/100,3);
+  g.fillStyle='#fff';g.font='bold 12px Tahoma';g.textAlign='center';g.fillText(NAMES[i],d[0],d[1]-31);g.globalAlpha=1});
+ // خريطة مصغرة
+ g.setTransform(1,0,0,1,0,0);const mw=130*(w/innerWidth),mh=mw*AH/AW,mx=w-mw-10,my=h*.12;g.fillStyle='rgba(10,14,10,.7)';g.fillRect(mx,my,mw,mh);
+ g.fillStyle='#555';WALLS.forEach(a=>g.fillRect(mx+a[0]/AW*mw,my+a[1]/AH*mh,a[2]/AW*mw,Math.max(2,a[3]/AH*mh)));
+ g.strokeStyle=zc;g.beginPath();g.arc(mx+ZONE[0]/AW*mw,my+ZONE[1]/AH*mh,ZONE[2]/AW*mw,0,7);g.stroke();
+ S.p.forEach((p,i)=>{if(p[12]&&p[9]){g.fillStyle=COL[i];g.beginPath();g.arc(mx+p[0]/AW*mw,my+p[1]/AH*mh,3,0,7);g.fill()}})}
+requestAnimationFrame(draw);
+</script></body></html>"""
+PAGE = PAGE.replace("__WALLS__", json.dumps([list(w) for w in WALLS])).replace("__ZONE__", json.dumps(list(ZONE)))
 
-@socketio.on("cancel_room")
-def on_cancel_room(data):
-    with world_lock:
-        info = sid_index.get(request.sid)
-        if not info or info[1] != 0:
-            return fail("إلغاء الغرفة متاح للمضيف فقط.")
-        room = rooms.get(info[0])
-        if not room or room["host_sid"] != request.sid:
-            return fail("صلاحية المضيف غير صالحة.")
-        room["state"] = "closed"
-        room_emit(room, "server_error", {"error": "ألغى المضيف الغرفة."})
-        for sid in list(room["players"].keys()):
-            sid_index.pop(sid, None)
-        rooms.pop(room["id"], None)
-        return {"ok": True}
-
-
-@socketio.on("input")
-def on_input(data):
-    if not allowed_rate(request.sid, "input", 35, 1.0):
-        return
-    if not isinstance(data, dict):
-        return
-
-    with world_lock:
-        info = sid_index.get(request.sid)
-        if not info:
-            return
-        room_id, slot = info
-        room = rooms.get(room_id)
-        if not room or room["state"] != "playing":
-            return
-        p = room["players"].get(request.sid)
-        if not p or p["slot"] != slot or room["slots"][slot] != request.sid:
-            return
-        if not p["connected"]:
-            return
-
-        # الخادم يحدد اللاعب من جلسة Socket.IO، لا من بيانات المتصفح.
-        if data.get("room_id") != room_id:
-            return
-
-        try:
-            seq = int(data.get("seq", 0))
-        except (TypeError, ValueError):
-            return
-        if seq <= 0:
-            return
-
-        def number(key, lo, hi, default=0.0):
-            try:
-                value = float(data.get(key, default))
-                if not math.isfinite(value):
-                    return default
-                return max(lo, min(hi, value))
-            except (TypeError, ValueError):
-                return default
-
-        p["move_x"] = number("move_x", -1, 1)
-        p["move_z"] = number("move_z", -1, 1)
-        p["yaw"] = (p["yaw"] + number("yaw_delta", -0.25, 0.25)) % (math.pi * 2)
-        p["pitch"] = max(-0.85, min(0.85, p["pitch"] + number("pitch_delta", -0.2, 0.2)))
-
-        p["fire"] = bool(data.get("fire"))
-        p["aim"] = bool(data.get("aim"))
-        p["sprint"] = bool(data.get("sprint"))
-        p["crouch"] = bool(data.get("crouch"))
-        p["last_input"] = now()
-        p["last_seen"] = now()
-        room["last_active"] = now()
-
-        if bool(data.get("jump")):
-            p["jump_requested"] = True
-        if bool(data.get("reload")):
-            reload_weapon(p)
-        if bool(data.get("grenade")):
-            p["grenade"] = True
-        if bool(data.get("switch_weapon")):
-            p["weapon"] = "smg" if p["weapon"] == "rifle" else "rifle"
-            w = WEAPONS[p["weapon"]]
-            p["ammo"] = min(p["ammo"], w["mag"])
-            p["reserve"] = min(p["reserve"], w["reserve"])
-        # interact محجوز للتفاعل مع أهداف لاحقة، ولا يمنح امتيازاً.
-        if bool(data.get("interact")):
-            pass
-
-
-@socketio.on("request_status")
-def on_request_status(data=None):
-    with world_lock:
-        info = sid_index.get(request.sid)
-        if not info:
-            return fail("هذا الاتصال غير مرتبط بغرفة.")
-        room = rooms.get(info[0])
-        if not room:
-            return fail("الغرفة غير موجودة.")
-        return {"ok": True, "room": public_room(room)}
-
-
-# ============================================================
-# 6. التشغيل
-# ============================================================
-
+# ---------- القسم 6: التشغيل ----------
 if __name__ == "__main__":
-    start_engine_once()
-    port = int(os.environ.get("PORT", "5000"))
-    socketio.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        allow_unsafe_werkzeug=True,
-    )
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), threaded=True)

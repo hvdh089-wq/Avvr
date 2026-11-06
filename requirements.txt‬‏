@@ -1,4 +1,3 @@
-flask
-flask-socketio
-simple-websocket
+Flask
+requests
 gunicorn
